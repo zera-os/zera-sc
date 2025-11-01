@@ -1,0 +1,15 @@
+[package]
+name = "release_v1"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+native_functions = { path = "../../../native_functions" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+base64 = "0.22"
