@@ -1,0 +1,23 @@
+[package]
+name = "zera_bridge_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = { version = "0.31.1", features = ["token", "associated_token"] }
+byteorder = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]

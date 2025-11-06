@@ -71,7 +71,26 @@ Located in `smart_contracts/staking/`
   - `principle`: Manages staked principal amounts
   - `principle_proxy`: Proxy for principle management
 
-### 7. Treasury
+### 7. Bridge System
+Located in `smart_contracts/bridge/`
+- **Purpose**: Bidirectional cross-chain bridge between Zera Network and Solana
+- **Architecture**:
+  - **Solana Side** (Anchor Framework):
+    - `zera_bridge_core`: Guardian management and governance
+    - `zera_bridge_token`: Token operations (lock/release/mint/burn)
+  - **Zera Network Side** (WasmEdge):
+    - `bridge_proxy`: Upgradeable proxy
+    - `bridge_logic` (bridge_v1): Main bridge implementation
+    - `bridge_gov` (bridge_gov_v1): Governance operations
+- **Security**: 2-of-3 guardian multi-signature verification
+- **Features**:
+  - Native token transfers (Zera ↔ Solana)
+  - Wrapped token creation and management
+  - Rate limiting ($10M per 24h, $1M per transaction)
+  - Pause mechanism for emergency stops
+  - Cross-chain governance coordination
+
+### 8. Treasury
 Located in `smart_contracts/treasury/`
 - **Purpose**: Central treasury for fund management
 - **Contracts**:
@@ -124,6 +143,7 @@ These contracts integrate with the Zera Network's native functions:
 
 ## Contract Addresses
 
+### Zera Network
 Proxy wallet addresses are hardcoded in each contract for security:
 - ACE Proxy: `6cifeAScHLGvxARJSdxS6QPdTJLwqgXMmHzXWyFU9tHC`
 - Circulating Supply Proxy: `EMK16opdneub97v9qC4NdSkMTsnvHsRf4LrdZ2KH3cky`
@@ -133,14 +153,28 @@ Proxy wallet addresses are hardcoded in each contract for security:
 - Early Backers Proxy: `AZfFcttA3nwqmEYzAtsmufops7PaxLYavvkkDRsxTX5j`
 - Principle Proxy: `8DABUMTHJtRXPTR4EkqHAYB6jW4XJy5F1YWNcFiSMDko`
 - Treasury: `4Yg2ZeYrzMjVBXvU2YWtuZ7CzWR9atnQCD35TQj1kKcH`
+- Bridge Proxy: `9fTYjLqHDqCmb1U71a6kRXEYNMwNvTF9xYX48HG4d1WA`
+
+### Solana Network
+Bridge program addresses:
+- Core Bridge Program: `zera3giq7oM9QJaD6mY1ajGmakv9TZcax5Giky99HD8`
+- Token Bridge Program: `WrapZ8f88HR8waSp7wR8Vgc68z4hKj3p3i2b81oeSxR`
 
 ## Technology Stack
 
+### Zera Network Contracts
 - **Language**: Rust
 - **Runtime**: WasmEdge
 - **Serialization**: Postcard + Base64
 - **Cryptography**: Native Zera functions (SHA256, SHA512, Blake3, SHAKE)
 - **Token Standard**: Zera native tokens
+
+### Solana Bridge Contracts
+- **Language**: Rust
+- **Framework**: Anchor 0.30+
+- **Runtime**: Solana BPF
+- **Token Standard**: SPL Token (with Metaplex metadata)
+- **Dependencies**: anchor-lang, anchor-spl, mpl-token-metadata
 
 ## Documentation Structure
 
