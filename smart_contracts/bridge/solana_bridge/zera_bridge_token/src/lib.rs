@@ -10,6 +10,9 @@ use mpl_token_metadata::types::{PrintSupply, TokenStandard};
 
 declare_id!("WrapZ8f88HR8waSp7wR8Vgc68z4hKj3p3i2b81oeSxR");
 
+/// Program version - update this single constant for each release
+pub const PROGRAM_VERSION: &str = "1.1.0";
+
 const ROUTER_SIGNER_SEED: &[u8] = b"router_signer";
 const EXPECTED_CORE_ID: Pubkey = pubkey!("zera3giq7oM9QJaD6mY1ajGmakv9TZcax5Giky99HD8");
 const MINT_AUTH_SEED: &[u8] = b"mint_authority";
@@ -27,6 +30,14 @@ const BRIDGE_INFO_SEED: &[u8] = b"bridge_info";
 const RATE_LIMIT_STATE_SEED: &[u8] = b"rate_limit_state";
 const TOKEN_PRICE_REGISTRY_SEED: &[u8] = b"token_price_registry";
 const ACTION_RESET_RATE_LIMIT: u8 = 100; // must match core
+const ACTION_REGISTER_TOKEN: u8 = 4;  // New: Register SPL token for bridging
+
+// Token Registration constants
+const TOKEN_REGISTRATION_SEED: &[u8] = b"token_registration";
+const PENDING_REGISTRATION_SEED: &[u8] = b"pending_registration";
+const TIER_UNPRICED: u8 = 0;   // Low liquidity tokens, $0 value for rate limits, can lock/release
+const TIER_PRICED: u8 = 1;     // Normal tokens, uses price/liquidity for rate limits, can lock/release
+const TIER_EXIT_ONLY: u8 = 2;  // Delisted tokens, no new locks/burns, releases/mints allowed (exit only)
 
 pub const ZERA_BRIDGE_TOKEN_DOMAIN: &[u8] = b"SOLANA_BRIDGE_TOKEN";
 
@@ -51,29 +62,135 @@ pub mod zera_bridge_token_v1 {
     pub fn initialize_token_price_registry(ctx: Context<InitializeTokenPriceRegistry>) -> Result<()> {
         let registry = &mut ctx.accounts.token_price_registry;
         registry.entries = Vec::new();
-        
+
         msg!("✅ Token price registry initialized");
-        
+
+        Ok(())
+    }
+
+    /// Register an SPL token for bridging. Requires guardian-signed VAA.
+    /// Creates a TokenRegistration PDA that stores price, liquidity, and tier info.
+    /// liquidity_usd_nano serves as both the liquidity value AND the per-token 24h rate limit.
+    pub fn register_token(
+        ctx: Context<RegisterToken>,
+        version: u8,
+        timestamp: u64,
+        expiry: u64,
+        tx_signature: [u8; 32],
+        event_index: u32,
+        usd_price_nano: u64,
+        liquidity_usd_nano: u64,
+        tier: u8,
+    ) -> Result<()> {
+        // Validate tier
+        require!(tier <= TIER_EXIT_ONLY, SimpleErr::InvalidTier);
+
+        // Optional freshness check
+        if expiry != 0 {
+            require!(
+                Clock::get()?.unix_timestamp <= expiry as i64,
+                SimpleErr::Expired
+            );
+        }
+
+        // Build payload: mint (32) + price (8) + liquidity (8) + tier (1)
+        let mut payload = Vec::with_capacity(32 + 8 + 8 + 1);
+        payload.extend_from_slice(ctx.accounts.mint.key().as_ref());
+        payload.extend_from_slice(&usd_price_nano.to_be_bytes());
+        payload.extend_from_slice(&liquidity_usd_nano.to_be_bytes());
+        payload.push(tier);
+
+        let expected_hash = vaa_body_hash(
+            version,
+            ZERA_BRIDGE_TOKEN_DOMAIN,
+            ACTION_REGISTER_TOKEN,
+            timestamp,
+            expiry,
+            tx_signature,
+            event_index,
+            ctx.accounts.target_program.key(),
+            &payload,
+        );
+
+        // Verify used_marker PDA exists (proves guardian signatures were verified by core)
+        let seeds: &[&[u8]] = &[VERIFIED_SEED, &expected_hash];
+        let (used_pda, _bump) = Pubkey::find_program_address(seeds, &EXPECTED_CORE_ID);
+
+        require_keys_eq!(
+            used_pda,
+            ctx.accounts.used_marker.key(),
+            SimpleErr::BadUsedMarkerPda
+        );
+        require_keys_eq!(
+            *ctx.accounts.used_marker.owner,
+            EXPECTED_CORE_ID,
+            SimpleErr::BadUsedMarkerOwner
+        );
+        require!(
+            ctx.accounts.used_marker.lamports() > 0,
+            SimpleErr::BadUsedMarkerLamports
+        );
+
+        // Initialize or update TokenRegistration
+        let token_registration = &mut ctx.accounts.token_registration;
+        let is_new = token_registration.mint == Pubkey::default();
+
+        if is_new {
+            // First registration - initialize all fields
+            token_registration.mint = ctx.accounts.mint.key();
+            token_registration.current_hour = (Clock::get()?.unix_timestamp / 3600) as u64;
+            token_registration.hourly_buckets = [0; 24];
+            token_registration.current_bucket_index = 0;
+        }
+        // Always update these fields (both new and existing)
+        token_registration.tier = tier;
+        token_registration.usd_price_nano = usd_price_nano;
+        token_registration.liquidity_usd_nano = liquidity_usd_nano;
+
+        msg!(
+            r#"{{"event":"{}","mint":"{}","tier":"{}","price_nano":"{}","liquidity_nano":"{}"}}"#,
+            if is_new { "Register_Token" } else { "Update_Token_Registration" },
+            ctx.accounts.mint.key(),
+            tier,
+            usd_price_nano,
+            liquidity_usd_nano
+        );
+
+        Ok(())
+    }
+
+    /// Request token registration - User-initiated on-chain request.
+    /// Creates a PendingTokenRegistration PDA that guardians can observe off-chain.
+    /// Guardians then decide whether to approve (via register_token VAA) or reject (no action).
+    pub fn request_token_registration(ctx: Context<RequestTokenRegistration>) -> Result<()> {
+        let pending = &mut ctx.accounts.pending_registration;
+        pending.mint = ctx.accounts.mint.key();
+
+        msg!(
+            r#"{{"event":"Request_Token_Registration","mint":"{}","version":"{}"}}"#,
+            ctx.accounts.mint.key(),
+            PROGRAM_VERSION
+        );
+
         Ok(())
     }
 
     //WORKING / should pause on level 2 - pause working
     pub fn lock_sol(ctx: Context<LockSol>, amount: u64, zera_address: Vec<u8>) -> Result<()> {
         require!(amount > 0, SimpleErr::InvalidAmount);
-        require!(
-            zera_address.len() <= 64,
-            SimpleErr::InvalidZeraAddressLength
-        );
+
+        // Validate Zera address format (base58, max 64 chars)
+        let zera_address_str = validate_zera_address(&zera_address, 64)?;
 
         // Load and validate router_cfg from core program
         let router_cfg_data = load_router_cfg(&ctx.accounts.router_cfg.to_account_info())?;
-        
+
         // Check pause (outgoing operation - block if level >= 2)
         check_pause(&router_cfg_data, 2)?;
 
         // Check rate limits (outgoing operation with single tx limit check)
-        // NEW ********************************************
-        let amount_usd_cents = get_usd_value(
+        // NOTE: get_usd_value returns value in nano-dollars
+        let amount_usd_nano = get_usd_value(
             amount,
             9, // SOL has 9 decimals
             &System::id(), // Native SOL uses system_program as mint identifier
@@ -82,13 +199,11 @@ pub mod zera_bridge_token_v1 {
         check_and_update_rate_limit(
             &mut ctx.accounts.rate_limit_state,
             &router_cfg_data,
-            amount_usd_cents,
+            amount_usd_nano,
             true, // is_outgoing
             true, // check_single_tx_limit
         )?;
         //******************** RATE LIMIT CHECK END *********************************** */
-        let zera_address_str = String::from_utf8(zera_address)
-            .map_err(|_| SimpleErr::InvalidZeraAddressLength)?;
 
         // Enforce/initialize the vault PDA owned by this program
         let (expected_vault, _bump) = Pubkey::find_program_address(&[VAULT_SEED], &crate::id());
@@ -131,7 +246,7 @@ pub mod zera_bridge_token_v1 {
 
         msg!(
             r#"{{"event":"Lock_SOL","version":"{}","payer":"{}","vault":"{}","amount":"{}","zera_address":"{}", "solana_sender":"{}"}}"#,
-            "1",
+            PROGRAM_VERSION,
             ctx.accounts.payer.key(),
             ctx.accounts.vault.key(),
             amount,
@@ -143,37 +258,58 @@ pub mod zera_bridge_token_v1 {
     }
     //WORKING / should pause on level 2 - pause working
     pub fn lock_spl(ctx: Context<LockSpl>, amount: u64, zera_address: Vec<u8>) -> Result<()> {
-        require!(
-            zera_address.len() <= 64,
-            SimpleErr::InvalidZeraAddressLength
-        );
-        let zera_address_str = String::from_utf8(zera_address)
-            .map_err(|_| SimpleErr::InvalidZeraAddressLength)?;
+        // Validate Zera address format (base58, max 64 chars)
+        let zera_address_str = validate_zera_address(&zera_address, 64)?;
 
         // Load and validate router_cfg from core program
         let router_cfg_data = load_router_cfg(&ctx.accounts.router_cfg.to_account_info())?;
-        
+
         // Check pause (outgoing operation - block if level >= 2)
         check_pause(&router_cfg_data, 2)?;
 
         require!(amount > 0, SimpleErr::InvalidAmount);
 
-        // Check rate limits (outgoing operation with single tx limit check)
-        // NEW ********************************************
-        let amount_usd_cents = get_usd_value(
+        // Block exit-only tokens (tier 2) - these can only be released, not locked
+        require!(
+            ctx.accounts.token_registration.tier != TIER_EXIT_ONLY,
+            SimpleErr::TokenExitOnly
+        );
+
+        // Check delisted status - price must be > 0 to lock new tokens
+        require!(
+            ctx.accounts.token_registration.usd_price_nano > 0,
+            SimpleErr::TokenDelisted
+        );
+
+        // Calculate effective USD value using TokenRegistration (in nano-dollars)
+        let effective_usd_nano = calculate_effective_value(
             amount,
             ctx.accounts.mint.decimals,
-            &ctx.accounts.mint.key(),
-            &ctx.accounts.token_price_registry,
-        )? as i64;
+            &ctx.accounts.token_registration,
+        );
+
+        // 1. Check single TX limit (global, outbound only)
+        if effective_usd_nano > router_cfg_data.single_tx_limit_usd_nano {
+            msg!("❌ Single transaction limit exceeded: {} > {}", effective_usd_nano, router_cfg_data.single_tx_limit_usd_nano);
+            return Err(error!(SimpleErr::SingleTxLimitExceeded));
+        }
+
+        // 2. Check and update per-token 24h rate limit
+        check_and_update_token_rate_limit(
+            &mut ctx.accounts.token_registration,
+            effective_usd_nano as i64,
+            true, // is_outgoing
+        )?;
+
+        // 3. Check and update global 24h rate limit
         check_and_update_rate_limit(
             &mut ctx.accounts.rate_limit_state,
             &router_cfg_data,
-            amount_usd_cents,
-            true, // is_outgoing
-            true, // check_single_tx_limit
+            effective_usd_nano as i64,
+            true,  // is_outgoing
+            false, // single tx already checked above
         )?;
-        //******************** RATE LIMIT CHECK END *********************************** */
+
         // disallow bridge-wrapped mints
         let (bridge_mint_auth, _) = Pubkey::find_program_address(
             &[MINT_AUTH_SEED, ctx.accounts.mint.key().as_ref()],
@@ -253,7 +389,7 @@ pub mod zera_bridge_token_v1 {
 
         msg!(
             r#"{{"event":"Lock_SPL","version":"{}","payer":"{}","vault_ata":"{}", "mint":"{}", "amount":"{}","zera_address":"{}", "solana_sender":"{}"}}"#,
-            "1",
+            PROGRAM_VERSION,
             ctx.accounts.payer.key(),
             ctx.accounts.vault_ata.key(),
             ctx.accounts.mint.key(),
@@ -274,7 +410,7 @@ pub mod zera_bridge_token_v1 {
         event_index: u32,
         amount: u64,
         recipient: Pubkey,
-        usd_price_cents: u64, // Guardian-attested price in USD cents
+        usd_price_nano: u64, // Guardian-attested price in nano-dollars (10^-9 USD)
     ) -> Result<()> {
         require!(amount > 0, SimpleErr::InvalidAmount);
 
@@ -290,6 +426,20 @@ pub mod zera_bridge_token_v1 {
             SimpleErr::BadRecipient
         );
 
+        // SECURITY: Validate recipient is a user wallet (EOA), not a program
+        // This prevents permanent fund loss if user specifies a program address
+        if *ctx.accounts.recipient.owner != System::id() {
+            msg!(
+                r#"{{"event":"Transfer_Rejected","reason":"InvalidRecipientType","recipient":"{}","recipient_owner":"{}","amount":"{}","txn_hash":"{}","event_index":"{}","action":"MANUAL_REFUND_REQUIRED"}}"#,
+                recipient,
+                ctx.accounts.recipient.owner,
+                amount,
+                to_hex(&txn_hash),
+                event_index
+            );
+            return Err(error!(SimpleErr::InvalidRecipientType));
+        }
+
         // Optional freshness
         if expiry != 0 {
             require!(
@@ -298,11 +448,11 @@ pub mod zera_bridge_token_v1 {
             );
         }
 
-        // Build payload: amount + recipient + usd_price_cents
+        // Build payload: amount + recipient + usd_price_nano
         let mut payload = Vec::with_capacity(8 + 32 + 8);
         payload.extend_from_slice(&amount.to_be_bytes());
         payload.extend_from_slice(recipient.as_ref());
-        payload.extend_from_slice(&usd_price_cents.to_be_bytes());
+        payload.extend_from_slice(&usd_price_nano.to_be_bytes());
 
         let expected_hash = vaa_body_hash(
             version,
@@ -352,19 +502,19 @@ pub mod zera_bridge_token_v1 {
         update_token_price_registry(
             &mut ctx.accounts.token_price_registry,
             System::id(), // Native SOL
-            usd_price_cents,
+            usd_price_nano,
         )?;
 
         // Track rate limits (incoming operation, NO single tx limit check)
-        // Calculate USD value directly from VAA's guardian-attested price
+        // Calculate USD value directly from VAA's guardian-attested price (in nano-dollars)
         let amount_u128 = amount as u128;
-        let price_u128 = usd_price_cents as u128;
-        let usd_cents = (amount_u128 * price_u128) / 1_000_000_000; // SOL has 9 decimals
-        let amount_usd_cents = usd_cents.min(u64::MAX as u128) as i64;
+        let price_u128 = usd_price_nano as u128;
+        let usd_nano = (amount_u128 * price_u128) / 1_000_000_000; // SOL has 9 decimals
+        let amount_usd_nano = usd_nano.min(u64::MAX as u128) as i64;
         check_and_update_rate_limit(
             &mut ctx.accounts.rate_limit_state,
             &router_cfg_data,
-            amount_usd_cents,
+            amount_usd_nano,
             false, // is_outgoing (this is incoming)
             false, // check_single_tx_limit (no check for incoming)
         )?;
@@ -415,6 +565,16 @@ pub mod zera_bridge_token_v1 {
         **ctx.accounts.vault.to_account_info().try_borrow_mut_lamports()? -= amount;
         **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? += amount;
 
+        msg!(
+            r#"{{"event":"Release_SOL","version":"{}","recipient":"{}","vault":"{}","amount":"{}","txn_hash":"{}","event_index":"{}"}}"#,
+            version,
+            recipient,
+            ctx.accounts.vault.key(),
+            amount,
+            to_hex(&txn_hash),
+            event_index
+        );
+
         Ok(())
     }
     //WORKING / should pause on level 1 - pause working
@@ -426,15 +586,32 @@ pub mod zera_bridge_token_v1 {
         txn_hash: [u8; 32],
         event_index: u32,
         amount: u64,
-        usd_price_cents: u64, // Guardian-attested price in USD cents
+        usd_price_nano: u64,         // Guardian-attested price in nano-dollars (10^-9 USD)
+        liquidity_usd_nano: u64,     // Guardian-attested liquidity = per-token 24h rate limit
+        tier: u8,                    // Token tier (0=Unpriced, 1=Priced)
     ) -> Result<()> {
         require!(amount > 0, SimpleErr::InvalidAmount);
+        require!(tier <= TIER_EXIT_ONLY, SimpleErr::InvalidTier);
 
         // Load and validate router_cfg from core program
         let router_cfg_data = load_router_cfg(&ctx.accounts.router_cfg.to_account_info())?;
-        
+
         // Check pause (incoming operation - block if level >= 1)
         check_pause(&router_cfg_data, 1)?;
+
+        // SECURITY: Validate recipient is a user wallet (EOA), not a program
+        // This prevents permanent fund loss if user specifies a program address
+        if *ctx.accounts.recipient.owner != System::id() {
+            msg!(
+                r#"{{"event":"Transfer_Rejected","reason":"InvalidRecipientType","recipient":"{}","recipient_owner":"{}","amount":"{}","txn_hash":"{}","event_index":"{}","action":"MANUAL_REFUND_REQUIRED"}}"#,
+                ctx.accounts.recipient.key(),
+                ctx.accounts.recipient.owner,
+                amount,
+                to_hex(&txn_hash),
+                event_index
+            );
+            return Err(error!(SimpleErr::InvalidRecipientType));
+        }
 
         // Optional freshness
         if expiry != 0 {
@@ -444,12 +621,14 @@ pub mod zera_bridge_token_v1 {
             );
         }
 
-        // Build payload: amount (8) + recipient (32) + mint (32) + usd_price_cents (8)
-        let mut payload = Vec::with_capacity(8 + 32 + 32 + 8);
+        // Build payload: amount (8) + recipient (32) + mint (32) + price (8) + liquidity (8) + tier (1)
+        let mut payload = Vec::with_capacity(8 + 32 + 32 + 8 + 8 + 1);
         payload.extend_from_slice(&amount.to_be_bytes());
         payload.extend_from_slice(ctx.accounts.recipient.key().as_ref());
         payload.extend_from_slice(ctx.accounts.mint.key().as_ref());
-        payload.extend_from_slice(&usd_price_cents.to_be_bytes());
+        payload.extend_from_slice(&usd_price_nano.to_be_bytes());
+        payload.extend_from_slice(&liquidity_usd_nano.to_be_bytes());
+        payload.push(tier);
 
         let expected_hash = vaa_body_hash(
             version,
@@ -463,25 +642,33 @@ pub mod zera_bridge_token_v1 {
             &payload,
         );
 
+        // Validate used_marker PDA
         let seeds: &[&[u8]] = &[VERIFIED_SEED, &expected_hash];
 
+        // Find used_marker PDA
         let (used_pda, _bump) = Pubkey::find_program_address(seeds, &EXPECTED_CORE_ID);
 
+        // Check used_marker PDA
         require_keys_eq!(
             used_pda,
             ctx.accounts.used_marker.key(),
             SimpleErr::BadUsedMarkerPda
         );
+
+        // Check used_marker owner
         require_keys_eq!(
             *ctx.accounts.used_marker.owner,
             EXPECTED_CORE_ID,
             SimpleErr::BadUsedMarkerOwner
         );
+
+        // Check used_marker lamports to ensure it doesnt exist
         require!(
             ctx.accounts.used_marker.lamports() > 0,
             SimpleErr::BadUsedMarkerLamports
         );
 
+            
         let released_seeds: &[&[u8]] = &[RELEASED_SEED, &expected_hash];
         let (released_pda, released_bump) =
             Pubkey::find_program_address(released_seeds, ctx.program_id);
@@ -495,24 +682,32 @@ pub mod zera_bridge_token_v1 {
             SimpleErr::BadRedeemedMarkerLamports
         );
 
-        // VAA verified! Now safe to update registry and check rate limits
-        update_token_price_registry(
-            &mut ctx.accounts.token_price_registry,
-            ctx.accounts.mint.key(),
-            usd_price_cents,
+        // VAA verified! Now safe to update TokenRegistration and check rate limits
+
+        // Update TokenRegistration with latest guardian-attested values
+        ctx.accounts.token_registration.usd_price_nano = usd_price_nano;
+        ctx.accounts.token_registration.liquidity_usd_nano = liquidity_usd_nano;
+        ctx.accounts.token_registration.tier = tier;
+
+        // Calculate effective USD value for rate limiting (in nano-dollars)
+        let effective_usd_nano = calculate_effective_value(
+            amount,
+            ctx.accounts.mint.decimals,
+            &ctx.accounts.token_registration,
+        );
+
+        // 1. Check and update per-token 24h rate limit
+        check_and_update_token_rate_limit(
+            &mut ctx.accounts.token_registration,
+            effective_usd_nano as i64,
+            false, // is_outgoing = false (this is incoming)
         )?;
 
-        // Track rate limits (incoming operation, NO single tx limit check)
-        // Calculate USD value directly from VAA's guardian-attested price
-        let amount_u128 = amount as u128;
-        let price_u128 = usd_price_cents as u128;
-        let decimals_divisor = 10u128.pow(ctx.accounts.mint.decimals as u32);
-        let usd_cents = (amount_u128 * price_u128) / decimals_divisor;
-        let amount_usd_cents = usd_cents.min(u64::MAX as u128) as i64;
+        // 2. Check and update global 24h rate limit
         check_and_update_rate_limit(
             &mut ctx.accounts.rate_limit_state,
             &router_cfg_data,
-            amount_usd_cents,
+            effective_usd_nano as i64,
             false, // is_outgoing (this is incoming)
             false, // check_single_tx_limit (no check for incoming)
         )?;
@@ -585,6 +780,17 @@ pub mod zera_bridge_token_v1 {
             ctx.program_id,
         )?;
 
+        msg!(
+            r#"{{"event":"Release_SPL","version":"{}","recipient":"{}","mint":"{}","vault_ata":"{}","amount":"{}","txn_hash":"{}","event_index":"{}"}}"#,
+            version,
+            ctx.accounts.recipient.key(),
+            ctx.accounts.mint.key(),
+            ctx.accounts.vault_ata.key(),
+            amount,
+            to_hex(&txn_hash),
+            event_index
+        );
+
         Ok(())
     }
     //WORKING / should pause on level 1 - pause working
@@ -601,19 +807,37 @@ pub mod zera_bridge_token_v1 {
         name: Option<String>,
         symbol: Option<String>,
         uri: Option<String>,
-        usd_price_cents: u64, // Guardian-attested price in USD cents
+        usd_price_nano: u64,         // Guardian-attested price in nano-dollars (10^-9 USD)
+        liquidity_usd_nano: u64,     // Guardian-attested liquidity = per-token 24h rate limit
+        tier: u8,                    // Token tier (0=Unpriced, 1=Priced)
     ) -> Result<()> {
         require!(amount > 0, SimpleErr::InvalidAmount);
         require!(
             zera_contract_id.len() > 0 && zera_contract_id.len() <= 64,
             SimpleErr::InvalidContractId
         );
+        require!(tier <= TIER_EXIT_ONLY, SimpleErr::InvalidTier);
 
         // Load and validate router_cfg from core program
         let router_cfg_data = load_router_cfg(&ctx.accounts.router_cfg.to_account_info())?;
         
         // Check pause (incoming operation - block if level >= 1)
         check_pause(&router_cfg_data, 1)?;
+
+        // SECURITY: Validate recipient is a user wallet (EOA), not a program
+        // This prevents permanent fund loss if user specifies a program address
+        if *ctx.accounts.recipient.owner != System::id() {
+            msg!(
+                r#"{{"event":"Transfer_Rejected","reason":"InvalidRecipientType","recipient":"{}","recipient_owner":"{}","amount":"{}","zera_contract_id":"{}","txn_hash":"{}","event_index":"{}","action":"MANUAL_REFUND_REQUIRED"}}"#,
+                ctx.accounts.recipient.key(),
+                ctx.accounts.recipient.owner,
+                amount,
+                String::from_utf8_lossy(&zera_contract_id),
+                to_hex(&txn_hash),
+                event_index
+            );
+            return Err(error!(SimpleErr::InvalidRecipientType));
+        }
 
         // Determine if this is first mint by checking if mint exists
         let is_first_mint = ctx.accounts.wrapped_mint.to_account_info().data_is_empty();
@@ -648,15 +872,15 @@ pub mod zera_bridge_token_v1 {
             let wrapped_n = format!("Wrapped {}", name_str);
             let wrapped_s = format!("w{}", symbol_str);
 
-            // Payload: amount (8) + recipient (32) + contract_id_len (2) + contract_id (var) 
-            //          + decimals (1) + name_len (1) + name (var) + symbol_len (1) + symbol (var) 
-            //          + uri_len (2) + uri (var) + usd_price_cents (8)
+            // Payload: amount (8) + recipient (32) + contract_id_len (2) + contract_id (var)
+            //          + decimals (1) + name_len (1) + name (var) + symbol_len (1) + symbol (var)
+            //          + uri_len (2) + uri (var) + price (8) + liquidity (8) + tier (1)
             let name_bytes = name_str.as_bytes();
             let symbol_bytes = symbol_str.as_bytes();
             let uri_bytes = uri_str.as_bytes();
-            
+
             let mut p = Vec::with_capacity(
-                8 + 32 + 2 + zera_contract_id.len() + 1 + 1 + name_bytes.len() + 1 + symbol_bytes.len() + 2 + uri_bytes.len() + 8
+                8 + 32 + 2 + zera_contract_id.len() + 1 + 1 + name_bytes.len() + 1 + symbol_bytes.len() + 2 + uri_bytes.len() + 8 + 8 + 1
             );
             p.extend_from_slice(&amount.to_be_bytes());
             p.extend_from_slice(recipient.as_ref());
@@ -669,18 +893,22 @@ pub mod zera_bridge_token_v1 {
             p.extend_from_slice(symbol_bytes);
             p.extend_from_slice(&(uri_bytes.len() as u16).to_be_bytes());
             p.extend_from_slice(uri_bytes);
-            p.extend_from_slice(&usd_price_cents.to_be_bytes());
+            p.extend_from_slice(&usd_price_nano.to_be_bytes());
+            p.extend_from_slice(&liquidity_usd_nano.to_be_bytes());
+            p.push(tier);
 
             (ACTION_MINT_WRAPPED_INIT, p, dec, wrapped_n, wrapped_s, uri_str)
         } else {
             // SUBSEQUENT MINT - Minimal payload (no metadata needed)
-            // Payload: amount (8) + recipient (32) + contract_id_len (2) + contract_id (var) + usd_price_cents (8)
-            let mut p = Vec::with_capacity(8 + 32 + 2 + zera_contract_id.len() + 8);
+            // Payload: amount (8) + recipient (32) + contract_id_len (2) + contract_id (var) + price (8) + liquidity (8) + tier (1)
+            let mut p = Vec::with_capacity(8 + 32 + 2 + zera_contract_id.len() + 8 + 8 + 1);
             p.extend_from_slice(&amount.to_be_bytes());
             p.extend_from_slice(recipient.as_ref());
             p.extend_from_slice(&(zera_contract_id.len() as u16).to_be_bytes());
             p.extend_from_slice(&zera_contract_id);
-            p.extend_from_slice(&usd_price_cents.to_be_bytes());
+            p.extend_from_slice(&usd_price_nano.to_be_bytes());
+            p.extend_from_slice(&liquidity_usd_nano.to_be_bytes());
+            p.push(tier);
 
             (ACTION_MINT_WRAPPED, p, 0, String::new(), String::new(), String::new())
         };
@@ -730,12 +958,18 @@ pub mod zera_bridge_token_v1 {
             SimpleErr::BadRedeemedMarkerLamports
         );
 
-        // VAA verified! Now safe to update registry and check rate limits
-        update_token_price_registry(
-            &mut ctx.accounts.token_price_registry,
-            mint_key,
-            usd_price_cents,
-        )?;
+        // VAA verified! Now safe to create/update TokenRegistration and check rate limits
+
+        // Derive expected TokenRegistration PDA
+        let (expected_registration, registration_bump) = Pubkey::find_program_address(
+            &[TOKEN_REGISTRATION_SEED, mint_key.as_ref()],
+            ctx.program_id,
+        );
+        require_keys_eq!(
+            expected_registration,
+            ctx.accounts.token_registration.key(),
+            SimpleErr::BadTokenRegistration
+        );
 
         // Determine decimals for rate limit check
         let decimals_for_rate_limit = if is_first_mint {
@@ -745,21 +979,116 @@ pub mod zera_bridge_token_v1 {
             let mint_account_info = ctx.accounts.wrapped_mint.to_account_info();
             let mint_data = mint_account_info.try_borrow_data()?;
             // Mint account: decimals is at offset 44 (after authority fields)
-            // See: https://docs.rs/spl-token/latest/spl_token/state/struct.Mint.html
             mint_data[44]
         };
 
-        // Track rate limits (incoming operation, NO single tx limit check)
-        // Calculate USD value directly from VAA's guardian-attested price
-        let amount_u128 = amount as u128;
-        let price_u128 = usd_price_cents as u128;
-        let decimals_divisor = 10u128.pow(decimals_for_rate_limit as u32);
-        let usd_cents = (amount_u128 * price_u128) / decimals_divisor;
-        let amount_usd_cents = usd_cents.min(u64::MAX as u128) as i64;
+        // Create or update TokenRegistration
+        if ctx.accounts.token_registration.to_account_info().data_is_empty() {
+            // FIRST MINT - Create TokenRegistration
+            let registration_lamports = Rent::get()?.minimum_balance(8 + TokenRegistration::SIZE);
+            let registration_seeds: &[&[u8]] = &[
+                TOKEN_REGISTRATION_SEED,
+                mint_key.as_ref(),
+                &[registration_bump],
+            ];
+
+            anchor_lang::system_program::create_account(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::CreateAccount {
+                        from: ctx.accounts.payer.to_account_info(),
+                        to: ctx.accounts.token_registration.to_account_info(),
+                    },
+                    &[registration_seeds],
+                ),
+                registration_lamports,
+                (8 + TokenRegistration::SIZE) as u64,
+                ctx.program_id,
+            )?;
+
+            // Initialize TokenRegistration
+            let mut registration_data = ctx.accounts.token_registration.try_borrow_mut_data()?;
+            let registration = TokenRegistration {
+                mint: mint_key,
+                tier,
+                usd_price_nano,
+                liquidity_usd_nano,
+                current_hour: (Clock::get()?.unix_timestamp / 3600) as u64,
+                hourly_buckets: [0; 24],
+                current_bucket_index: 0,
+            };
+            // Write discriminator and data
+            registration.try_serialize(&mut &mut registration_data[..])?;
+        } else {
+            // SUBSEQUENT MINT - Update TokenRegistration
+            let mut registration_data = ctx.accounts.token_registration.try_borrow_mut_data()?;
+            let mut registration = TokenRegistration::try_deserialize(&mut &registration_data[..])?;
+
+            registration.usd_price_nano = usd_price_nano;
+            registration.liquidity_usd_nano = liquidity_usd_nano;
+            registration.tier = tier;
+
+            registration.try_serialize(&mut &mut registration_data[..])?;
+        }
+
+        // Load registration for rate limit check
+        let registration_data = ctx.accounts.token_registration.try_borrow_data()?;
+        let registration = TokenRegistration::try_deserialize(&mut &registration_data[..])?;
+        drop(registration_data);
+
+        // Calculate effective USD value for rate limiting (in nano-dollars)
+        let effective_usd_nano = calculate_effective_value(
+            amount,
+            decimals_for_rate_limit,
+            &registration,
+        );
+
+        // Update per-token rate limit buckets (need mutable borrow)
+        {
+            let mut registration_data = ctx.accounts.token_registration.try_borrow_mut_data()?;
+            let mut registration = TokenRegistration::try_deserialize(&mut &registration_data[..])?;
+
+            // Rotate buckets if needed and update
+            let current_time = Clock::get()?.unix_timestamp;
+            let current_hour = (current_time / 3600) as u64;
+
+            if current_hour != registration.current_hour {
+                let hours_elapsed = current_hour.saturating_sub(registration.current_hour);
+                if hours_elapsed >= 24 {
+                    registration.hourly_buckets = [0; 24];
+                    registration.current_bucket_index = 0;
+                } else {
+                    for _ in 0..hours_elapsed {
+                        registration.current_bucket_index = (registration.current_bucket_index + 1) % 24;
+                        registration.hourly_buckets[registration.current_bucket_index as usize] = 0;
+                    }
+                }
+                registration.current_hour = current_hour;
+            }
+
+            // Check per-token limit (liquidity_usd_nano serves as the rate limit)
+            let current_net_flow: i64 = registration.hourly_buckets.iter().sum();
+            let flow_delta = effective_usd_nano as i64; // incoming = positive
+            let new_net_flow = current_net_flow + flow_delta;
+
+            let limit = registration.liquidity_usd_nano as i64;
+            if new_net_flow.abs() > limit {
+                msg!("❌ Per-token rate limit exceeded: new_net_flow={} limit={}", new_net_flow, limit);
+                return Err(error!(SimpleErr::TokenRateLimitExceeded));
+            }
+
+            // Update bucket
+            registration.hourly_buckets[registration.current_bucket_index as usize] += flow_delta;
+            msg!("✅ Per-token rate limit check passed: net_flow={} (token: {})", new_net_flow, registration.mint);
+
+            registration.try_serialize(&mut &mut registration_data[..])?;
+        }
+
+        // Check and update global rate limit
         check_and_update_rate_limit(
             &mut ctx.accounts.rate_limit_state,
             &router_cfg_data,
-            amount_usd_cents,
+            effective_usd_nano as i64,
             false, // is_outgoing (this is incoming)
             false, // check_single_tx_limit (no check for incoming)
         )?;
@@ -869,29 +1198,31 @@ pub mod zera_bridge_token_v1 {
             let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
             
             token::initialize_mint(cpi_ctx, decimals_val, &expected_mint_auth, None)?;
-                     
+            
+            //TODO : ADD BACK FOR DEVNET/MAINNET
             /* COMMENTED OUT FOR LOCALNET - Uncomment for devnet/mainnet: */
-            CreateV1CpiBuilder::new(&ctx.accounts.metadata_program.to_account_info())
-                .metadata(&ctx.accounts.metadata.to_account_info())
-                .mint(&ctx.accounts.wrapped_mint.to_account_info(), false)
-                .authority(&ctx.accounts.mint_authority.to_account_info())
-                .payer(&ctx.accounts.payer.to_account_info())
-                .update_authority(&ctx.accounts.mint_authority.to_account_info(), false)
-                .system_program(&ctx.accounts.system_program.to_account_info())
-                .sysvar_instructions(&ctx.accounts.sysvar_instructions.to_account_info())
-                .spl_token_program(Some(&ctx.accounts.token_program.to_account_info()))
-                .name(wrapped_name.clone())
-                .symbol(wrapped_symbol.clone())
-                .uri(uri_val.clone())
-                .seller_fee_basis_points(0)
-                .decimals(decimals_val)
-                .token_standard(TokenStandard::Fungible)
-                .print_supply(PrintSupply::Zero)
-                .invoke_signed(&[&[
-                    MINT_AUTH_SEED,
-                    ctx.accounts.wrapped_mint.key().as_ref(),
-                    &[mint_auth_bump],
-                ]])?;
+            
+            // CreateV1CpiBuilder::new(&ctx.accounts.metadata_program.to_account_info())
+            //     .metadata(&ctx.accounts.metadata.to_account_info())
+            //     .mint(&ctx.accounts.wrapped_mint.to_account_info(), false)
+            //     .authority(&ctx.accounts.mint_authority.to_account_info())
+            //     .payer(&ctx.accounts.payer.to_account_info())
+            //     .update_authority(&ctx.accounts.mint_authority.to_account_info(), false)
+            //     .system_program(&ctx.accounts.system_program.to_account_info())
+            //     .sysvar_instructions(&ctx.accounts.sysvar_instructions.to_account_info())
+            //     .spl_token_program(Some(&ctx.accounts.token_program.to_account_info()))
+            //     .name(wrapped_name.clone())
+            //     .symbol(wrapped_symbol.clone())
+            //     .uri(uri_val.clone())
+            //     .seller_fee_basis_points(0)
+            //     .decimals(decimals_val)
+            //     .token_standard(TokenStandard::Fungible)
+            //     .print_supply(PrintSupply::Zero)
+            //     .invoke_signed(&[&[
+            //         MINT_AUTH_SEED,
+            //         ctx.accounts.wrapped_mint.key().as_ref(),
+            //         &[mint_auth_bump],
+            //     ]])?;
     
 
             let bridge_info_lamports = Rent::get()?.minimum_balance(BridgeTokenInfo::MAX_SIZE);
@@ -1024,43 +1355,87 @@ pub mod zera_bridge_token_v1 {
             ctx.program_id,
         )?;
 
-        //TODO: add event logging
+        if is_first_mint {
+            msg!(
+                r#"{{"event":"Mint_Wrapped_Init","version":"{}","recipient":"{}","mint":"{}","zera_contract_id":"{}","amount":"{}","decimals":"{}","name":"{}","symbol":"{}","txn_hash":"{}","event_index":"{}"}}"#,
+                version,
+                recipient,
+                ctx.accounts.wrapped_mint.key(),
+                String::from_utf8_lossy(&zera_contract_id),
+                amount,
+                decimals_val,
+                wrapped_name,
+                wrapped_symbol,
+                to_hex(&txn_hash),
+                event_index
+            );
+        } else {
+            msg!(
+                r#"{{"event":"Mint_Wrapped","version":"{}","recipient":"{}","mint":"{}","zera_contract_id":"{}","amount":"{}","txn_hash":"{}","event_index":"{}"}}"#,
+                version,
+                recipient,
+                ctx.accounts.wrapped_mint.key(),
+                String::from_utf8_lossy(&zera_contract_id),
+                amount,
+                to_hex(&txn_hash),
+                event_index
+            );
+        }
+
         Ok(())
     }
-    //WORKING / should pause on level 2 - pause working
+
     pub fn burn_wrapped(
         ctx: Context<BurnWrapped>,
         amount: u64,
         zera_recipient: Vec<u8>,
     ) -> Result<()> {
         require!(amount > 0, SimpleErr::InvalidAmount);
-        require!(
-            zera_recipient.len() > 0 && zera_recipient.len() <= 128,
-            SimpleErr::InvalidZeraAddressLength
-        );
+
+        // Validate Zera recipient address format (base58, max 64 chars)
+        let zera_recipient_str = validate_zera_address(&zera_recipient, 64)?;
 
         // Load and validate router_cfg from core program
         let router_cfg_data = load_router_cfg(&ctx.accounts.router_cfg.to_account_info())?;
-        
+
         // Check pause (outgoing operation - block if level >= 2)
         check_pause(&router_cfg_data, 2)?;
 
-        // NEW ********************************************
-        // Check rate limits (outgoing operation with single tx limit check)
-        let amount_usd_cents = get_usd_value(
+        // Block exit-only tokens (tier 2) - these can only receive mints, not burn back
+        require!(
+            ctx.accounts.token_registration.tier != TIER_EXIT_ONLY,
+            SimpleErr::TokenExitOnly
+        );
+
+        // Calculate effective USD value using TokenRegistration (in nano-dollars)
+        let effective_usd_nano = calculate_effective_value(
             amount,
             ctx.accounts.wrapped_mint.decimals,
-            &ctx.accounts.wrapped_mint.key(),
-            &ctx.accounts.token_price_registry,
-        )? as i64;
+            &ctx.accounts.token_registration,
+        );
+
+        // 1. Check single TX limit (global, outbound only)
+        if effective_usd_nano > router_cfg_data.single_tx_limit_usd_nano {
+            msg!("❌ Single transaction limit exceeded: {} > {}", effective_usd_nano, router_cfg_data.single_tx_limit_usd_nano);
+            return Err(error!(SimpleErr::SingleTxLimitExceeded));
+        }
+
+        // 2. Check and update per-token 24h rate limit
+        check_and_update_token_rate_limit(
+            &mut ctx.accounts.token_registration,
+            effective_usd_nano as i64,
+            true, // is_outgoing
+        )?;
+
+        // 3. Check and update global 24h rate limit
         check_and_update_rate_limit(
             &mut ctx.accounts.rate_limit_state,
             &router_cfg_data,
-            amount_usd_cents,
-            true, // is_outgoing
-            true, // check_single_tx_limit
+            effective_usd_nano as i64,
+            true,  // is_outgoing
+            false, // single tx already checked above
         )?;
-        //******************** RATE LIMIT CHECK END *********************************** */
+
         // Validate bridge_info exists (this is a wrapped token)
         require!(
             !ctx.accounts.bridge_info.to_account_info().data_is_empty(),
@@ -1124,12 +1499,13 @@ pub mod zera_bridge_token_v1 {
 
         // Log the burn event for off-chain indexing
         msg!(
-            r#"{{"event":"Burn_Wrapped","version":"1", "authority":"{}", "mint":"{}","zera_contract_id":"{}","amount":"{}","zera_address":"{}","solana_sender":"{}"}}"#,
+            r#"{{"event":"Burn_Wrapped","version":"{}", "authority":"{}", "mint":"{}","zera_contract_id":"{}","amount":"{}","zera_address":"{}","solana_sender":"{}"}}"#,
+            PROGRAM_VERSION,
             ctx.accounts.authority.key(),
             ctx.accounts.wrapped_mint.key(),
             String::from_utf8_lossy(&stored_info.zera_contract_id),
             amount,
-            String::from_utf8_lossy(&zera_recipient),
+            zera_recipient_str,
             ctx.accounts.authority.key()
         );
 
@@ -1182,10 +1558,10 @@ pub struct CoreRouterConfig {
     pub version: u32,
     pub cfg_bump: u8,
     pub signer_bump: u8,
-    pub pause_level: u8,      // 0=Active, 1=IncomingOnly, 2=Complete
-    pub pause_expiry: i64,    // Unix timestamp, 0=indefinite
-    pub rate_limit_usd: u64,  // 24-hour rate limit in cents
-    pub single_tx_limit_usd: u64, // Per-transaction limit in cents
+    pub pause_level: u8,            // 0=Active, 1=IncomingOnly, 2=Complete
+    pub pause_expiry: i64,          // Unix timestamp, 0=indefinite
+    pub rate_limit_usd_nano: u64,   // 24-hour rate limit in nano-dollars (10^-9 USD)
+    pub single_tx_limit_usd_nano: u64, // Per-transaction limit in nano-dollars
 }
 
 fn check_pause(cfg: &CoreRouterConfig, required_level: u8) -> Result<()> {
@@ -1224,6 +1600,44 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Validates a Zera address format (base58 encoded).
+///
+/// Valid Zera addresses must:
+/// - Be non-empty and at most max_len bytes
+/// - Be valid UTF-8
+/// - Contain only valid base58 characters (alphanumeric except 0, O, I, l)
+///
+/// Base58 alphabet: 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
+///
+/// Returns the validated address as a String if valid.
+fn validate_zera_address(address_bytes: &[u8], max_len: usize) -> Result<String> {
+    // Check length bounds
+    require!(
+        !address_bytes.is_empty() && address_bytes.len() <= max_len,
+        SimpleErr::InvalidZeraAddressLength
+    );
+
+    // Validate UTF-8 encoding
+    let address_str = String::from_utf8(address_bytes.to_vec())
+        .map_err(|_| error!(SimpleErr::InvalidZeraAddressFormat))?;
+
+    // Validate all characters are valid base58
+    // Base58 alphabet excludes: 0, O, I, l (to avoid visual ambiguity)
+    for b in address_str.bytes() {
+        let is_valid_base58 = matches!(b,
+            b'1'..=b'9' |                           // 1-9 (no 0)
+            b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'Z' | // A-Z except I and O
+            b'a'..=b'h' | b'j'..=b'k' | b'm'..=b'z'   // a-z except l
+        );
+
+        if !is_valid_base58 {
+            return Err(error!(SimpleErr::InvalidZeraAddressFormat));
+        }
+    }
+
+    Ok(address_str)
+}
+
 // Compute body hash exactly like core
 fn vaa_body_hash(
     version: u8,
@@ -1251,29 +1665,25 @@ fn vaa_body_hash(
 }
 
 // Update or add entry in token price registry
-// If usd_price_cents is 0, skip adding to registry (treat as $0 token)
+// If usd_price_nano is 0, skip adding to registry (treat as $0 token)
 fn update_token_price_registry(
     registry: &mut TokenPriceRegistry,
     mint: Pubkey,
-    usd_price_cents: u64,
+    usd_price_nano: u64,
 ) -> Result<()> {
     // If price is 0, don't add to registry (will default to $0 on lookup)
-    if usd_price_cents == 0 {
+    if usd_price_nano == 0 {
         msg!("Token price is $0, not adding to registry: {}", mint);
         return Ok(());
     }
 
     let now = Clock::get()?.unix_timestamp;
-    
+
     // Check if entry exists, update it
     if let Some(entry) = registry.entries.iter_mut().find(|e| e.mint == mint) {
-        entry.usd_price_cents = usd_price_cents;
+        entry.usd_price_nano = usd_price_nano;
         entry.last_updated = now;
-        msg!("Updated price for mint {}: ${}.{:02}", 
-            mint, 
-            usd_price_cents / 100, 
-            usd_price_cents % 100
-        );
+        msg!("Updated price for mint {}: {} nano-dollars", mint, usd_price_nano);
     } else {
         // Add new entry
         require!(
@@ -1282,21 +1692,17 @@ fn update_token_price_registry(
         );
         registry.entries.push(TokenPriceEntry {
             mint,
-            usd_price_cents,
+            usd_price_nano,
             last_updated: now,
         });
-        msg!("Added new price for mint {}: ${}.{:02}", 
-            mint, 
-            usd_price_cents / 100, 
-            usd_price_cents % 100
-        );
+        msg!("Added new price for mint {}: {} nano-dollars", mint, usd_price_nano);
     }
-    
+
     Ok(())
 }
 
 // Get USD value from guardian-attested prices in registry
-// Returns USD value in cents, or 0 if not in registry
+// Returns USD value in nano-dollars, or 0 if not in registry
 fn get_usd_value(
     amount: u64,
     decimals: u8,
@@ -1304,25 +1710,25 @@ fn get_usd_value(
     registry: &TokenPriceRegistry,
 ) -> Result<u64> {
     // Look up price in registry
-    let price_cents = registry.entries.iter()
+    let price_nano = registry.entries.iter()
         .find(|e| &e.mint == mint)
-        .map(|e| e.usd_price_cents)
+        .map(|e| e.usd_price_nano)
         .unwrap_or(0);
-    
-    if price_cents == 0 {
+
+    if price_nano == 0 {
         return Ok(0);
     }
 
-    // Calculate USD value: (amount * price_cents) / (10^decimals)
+    // Calculate USD value in nano-dollars: (amount * price_nano) / (10^decimals)
     // Use u128 to prevent overflow
     let amount_u128 = amount as u128;
-    let price_u128 = price_cents as u128;
+    let price_u128 = price_nano as u128;
     let decimals_divisor = 10u128.pow(decimals as u32);
-    
-    let usd_cents = (amount_u128 * price_u128) / decimals_divisor;
-    
+
+    let usd_nano = (amount_u128 * price_u128) / decimals_divisor;
+
     // Cap at u64::MAX for safety
-    Ok(usd_cents.min(u64::MAX as u128) as u64)
+    Ok(usd_nano.min(u64::MAX as u128) as u64)
 }
 
 // Check and update rate limits
@@ -1340,8 +1746,8 @@ fn check_and_update_rate_limit(
     // Check single transaction limit (only for outgoing)
     if check_single_tx_limit && is_outgoing {
         let abs_amount = amount_usd.abs() as u64;
-        if abs_amount > router_cfg.single_tx_limit_usd {
-            msg!("❌ Single transaction limit exceeded: {} > {}", abs_amount, router_cfg.single_tx_limit_usd);
+        if abs_amount > router_cfg.single_tx_limit_usd_nano {
+            msg!("❌ Single transaction limit exceeded: {} > {}", abs_amount, router_cfg.single_tx_limit_usd_nano);
             return Err(error!(SimpleErr::SingleTxLimitExceeded));
         }
     }
@@ -1373,7 +1779,7 @@ fn check_and_update_rate_limit(
     let new_net_flow = current_net_flow + flow_delta;
 
     // Check if new flow would exceed limits
-    let limit = router_cfg.rate_limit_usd as i64;
+    let limit = router_cfg.rate_limit_usd_nano as i64;
     if new_net_flow.abs() > limit {
         msg!("❌ Rate limit exceeded: new_net_flow={} limit={}", new_net_flow, limit);
         msg!("   Current flow: {} | Delta: {} | Direction: {}",
@@ -1385,7 +1791,91 @@ fn check_and_update_rate_limit(
     rate_limit_state.hourly_buckets[rate_limit_state.current_bucket_index as usize] += flow_delta;
 
     msg!("✅ Rate limit check passed: net_flow={} (was {})", new_net_flow, current_net_flow);
-    
+
+    Ok(())
+}
+
+/// Calculate effective USD value for rate limiting, applying tier and liquidity caps
+/// Returns value in nano-dollars (10^-9 USD)
+/// Returns 0 for Tier 0 tokens or delisted tokens (price = 0)
+fn calculate_effective_value(
+    amount: u64,
+    decimals: u8,
+    registration: &TokenRegistration,
+) -> u64 {
+    // Tier 0 (unpriced) = always $0 (doesn't affect rate limits)
+    // Tier 2 (exit-only) = always $0 (releases don't affect rate limits)
+    if registration.tier == TIER_UNPRICED || registration.tier == TIER_EXIT_ONLY {
+        return 0;
+    }
+
+    // Delisted (price = 0) = $0
+    if registration.usd_price_nano == 0 {
+        return 0;
+    }
+
+    // Calculate raw USD value in nano-dollars: (amount * price_nano) / 10^decimals
+    let amount_u128 = amount as u128;
+    let price_u128 = registration.usd_price_nano as u128;
+    let decimals_divisor = 10u128.pow(decimals as u32);
+    let raw_usd_nano = (amount_u128 * price_u128) / decimals_divisor;
+
+    // Cap by liquidity (prevents price manipulation attacks)
+    let effective = raw_usd_nano.min(registration.liquidity_usd_nano as u128);
+
+    effective.min(u64::MAX as u128) as u64
+}
+
+/// Check and update per-token rate limit
+/// Mirrors the global rate limit logic but operates on TokenRegistration
+fn check_and_update_token_rate_limit(
+    registration: &mut TokenRegistration,
+    amount_usd: i64,
+    is_outgoing: bool,
+) -> Result<()> {
+    let current_time = Clock::get()?.unix_timestamp;
+    let current_hour = (current_time / 3600) as u64;
+
+    // Rotate buckets if we've moved to a new hour
+    if current_hour != registration.current_hour {
+        let hours_elapsed = current_hour.saturating_sub(registration.current_hour);
+
+        if hours_elapsed >= 24 {
+            // More than 24 hours passed, reset all buckets
+            registration.hourly_buckets = [0; 24];
+            registration.current_bucket_index = 0;
+        } else {
+            // Rotate buckets forward
+            for _ in 0..hours_elapsed {
+                registration.current_bucket_index = (registration.current_bucket_index + 1) % 24;
+                registration.hourly_buckets[registration.current_bucket_index as usize] = 0;
+            }
+        }
+
+        registration.current_hour = current_hour;
+    }
+
+    // Calculate current net flow across all 24 buckets
+    let current_net_flow: i64 = registration.hourly_buckets.iter().sum();
+
+    // Calculate what the new net flow would be
+    let flow_delta = if is_outgoing { -amount_usd } else { amount_usd };
+    let new_net_flow = current_net_flow + flow_delta;
+
+    // Check if new flow would exceed per-token limit (liquidity_usd_nano serves as the rate limit)
+    let limit = registration.liquidity_usd_nano as i64;
+    if new_net_flow.abs() > limit {
+        msg!("❌ Per-token rate limit exceeded: new_net_flow={} limit={}", new_net_flow, limit);
+        msg!("   Token: {} | Current flow: {} | Delta: {}",
+            registration.mint, current_net_flow, flow_delta);
+        return Err(error!(SimpleErr::TokenRateLimitExceeded));
+    }
+
+    // Update current bucket
+    registration.hourly_buckets[registration.current_bucket_index as usize] += flow_delta;
+
+    msg!("✅ Per-token rate limit check passed: net_flow={} (token: {})", new_net_flow, registration.mint);
+
     Ok(())
 }
 
@@ -1446,6 +1936,61 @@ pub struct InitializeTokenPriceRegistry<'info> {
 }
 
 #[derive(Accounts)]
+pub struct RegisterToken<'info> {
+    /// CHECK: verified by address constraint
+    #[account(address = EXPECTED_CORE_ID)]
+    pub core_program: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// The token mint being registered
+    pub mint: Account<'info, Mint>,
+
+    /// TokenRegistration PDA - created on first registration, updated on subsequent
+    /// ///////
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + TokenRegistration::SIZE,
+        seeds = [TOKEN_REGISTRATION_SEED, mint.key().as_ref()],
+        bump
+    )]
+    pub token_registration: Account<'info, TokenRegistration>,
+
+    /// Core's verified transfer marker (proves guardian signatures)
+    /// CHECK: validated against expected PDA in instruction
+    pub used_marker: UncheckedAccount<'info>,
+
+    /// CHECK: verified by address constraint
+    #[account(address = crate::id())]
+    pub target_program: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RequestTokenRegistration<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// The token mint to request registration for
+    pub mint: Account<'info, Mint>,
+
+    /// PendingTokenRegistration PDA - created if needed, updated if exists
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + PendingTokenRegistration::SIZE,
+        seeds = [PENDING_REGISTRATION_SEED, mint.key().as_ref()],
+        bump
+    )]
+    pub pending_registration: Account<'info, PendingTokenRegistration>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct LockSpl<'info> {
     /// CHECK: verified by address constraint
     #[account(address = EXPECTED_CORE_ID)]
@@ -1468,9 +2013,14 @@ pub struct LockSpl<'info> {
     /// Rate limit state PDA [b"rate_limit_state"]
     #[account(mut, seeds=[RATE_LIMIT_STATE_SEED], bump)]
     pub rate_limit_state: Account<'info, RateLimitState>,
-    /// Price feed registry PDA [b"token_price_registry"]
-    #[account(seeds=[TOKEN_PRICE_REGISTRY_SEED], bump)]
-    pub token_price_registry: Account<'info, TokenPriceRegistry>,
+    /// TokenRegistration PDA for this token [b"token_registration", mint]
+    #[account(
+        mut,
+        seeds = [TOKEN_REGISTRATION_SEED, mint.key().as_ref()],
+        bump,
+        constraint = token_registration.mint == mint.key() @ SimpleErr::BadTokenRegistration
+    )]
+    pub token_registration: Account<'info, TokenRegistration>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -1547,12 +2097,17 @@ pub struct ReleaseSpl<'info> {
     /// Rate limit state PDA [b"rate_limit_state"]
     #[account(mut, seeds=[RATE_LIMIT_STATE_SEED], bump)]
     pub rate_limit_state: Account<'info, RateLimitState>,
-    /// Price feed registry PDA [b"token_price_registry"]
-    #[account(mut, seeds=[TOKEN_PRICE_REGISTRY_SEED], bump)]
-    pub token_price_registry: Account<'info, TokenPriceRegistry>,
+    /// TokenRegistration PDA for this token [b"token_registration", mint]
+    #[account(
+        mut,
+        seeds = [TOKEN_REGISTRATION_SEED, mint.key().as_ref()],
+        bump,
+        constraint = token_registration.mint == mint.key() @ SimpleErr::BadTokenRegistration
+    )]
+    pub token_registration: Account<'info, TokenRegistration>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
-    
+
     /// CHECK: verified by address constraint
     #[account(address = crate::id())]
     pub target_program: UncheckedAccount<'info>,
@@ -1605,10 +2160,11 @@ pub struct MintWrapped<'info> {
     /// Rate limit state PDA [b"rate_limit_state"]
     #[account(mut, seeds=[RATE_LIMIT_STATE_SEED], bump)]
     pub rate_limit_state: Account<'info, RateLimitState>,
-    /// Price feed registry PDA [b"token_price_registry"]
-    #[account(mut, seeds=[TOKEN_PRICE_REGISTRY_SEED], bump)]
-    pub token_price_registry: Account<'info, TokenPriceRegistry>,
-    
+    /// TokenRegistration PDA for this wrapped token [b"token_registration", mint]
+    /// CHECK: Created on first mint if needed, validated in function
+    #[account(mut)]
+    pub token_registration: UncheckedAccount<'info>,
+
     /// CHECK: verified by address constraint
     #[account(address = crate::id())]
     pub target_program: UncheckedAccount<'info>,
@@ -1647,9 +2203,14 @@ pub struct BurnWrapped<'info> {
     /// Rate limit state PDA [b"rate_limit_state"]
     #[account(mut, seeds=[RATE_LIMIT_STATE_SEED], bump)]
     pub rate_limit_state: Account<'info, RateLimitState>,
-    /// Price feed registry PDA [b"token_price_registry"]
-    #[account(seeds=[TOKEN_PRICE_REGISTRY_SEED], bump)]
-    pub token_price_registry: Account<'info, TokenPriceRegistry>,
+    /// TokenRegistration PDA for this wrapped token [b"token_registration", mint]
+    #[account(
+        mut,
+        seeds = [TOKEN_REGISTRATION_SEED, wrapped_mint.key().as_ref()],
+        bump,
+        constraint = token_registration.mint == wrapped_mint.key() @ SimpleErr::BadTokenRegistration
+    )]
+    pub token_registration: Account<'info, TokenRegistration>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -1674,7 +2235,7 @@ impl BridgeTokenInfo {
 #[account]
 pub struct RateLimitState {
     pub current_hour: u64,           // Current hour (Unix timestamp / 3600)
-    pub hourly_buckets: [i64; 24],   // Net flow per hour in USD cents (signed)
+    pub hourly_buckets: [i64; 24],   // Net flow per hour in nano-dollars (signed)
     pub current_bucket_index: u8,    // Which bucket we're currently in (0-23)
 }
 
@@ -1698,12 +2259,54 @@ impl TokenPriceRegistry {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct TokenPriceEntry {
     pub mint: Pubkey,              // Token mint (System::id() for native SOL)
-    pub usd_price_cents: u64,      // Guardian-attested price in USD cents
+    pub usd_price_nano: u64,       // Guardian-attested price in nano-dollars (10^-9 USD)
     pub last_updated: i64,         // Timestamp when guardians last updated
 }
 
 impl TokenPriceEntry {
-    pub const SIZE: usize = 32 + 8 + 8; // mint + usd_price_cents + last_updated
+    pub const SIZE: usize = 32 + 8 + 8; // mint + usd_price_nano + last_updated
+}
+
+/// Per-token registration account for SPL tokens bridging to/from Zera
+/// Created via guardian VAA for native SPL tokens, or on first mint for wrapped tokens
+/// PDA: [b"token_registration", mint.as_ref()]
+#[account]
+pub struct TokenRegistration {
+    // === Token Info ===
+    pub mint: Pubkey,                    // 32 bytes - The token mint
+    pub tier: u8,                        // 1 byte - 0=Unpriced ($0 value), 1=Priced (uses liquidity as rate limit)
+    pub usd_price_nano: u64,             // 8 bytes - Guardian-attested price in nano-dollars (0 = delisted)
+    pub liquidity_usd_nano: u64,         // 8 bytes - Guardian-attested liquidity = per-token 24h rate limit
+
+    // === Per-Token Rate Limit State ===
+    pub current_hour: u64,               // 8 bytes - Current hour for bucket rotation
+    pub hourly_buckets: [i64; 24],       // 192 bytes - Net flow per hour in nano-dollars (signed)
+    pub current_bucket_index: u8,        // 1 byte - Which bucket we're currently in (0-23)
+}
+
+impl TokenRegistration {
+    pub const SIZE: usize =
+        32 +  // mint
+        1 +   // tier
+        8 +   // usd_price_nano
+        8 +   // liquidity_usd_nano (also serves as rate limit)
+        8 +   // current_hour
+        192 + // hourly_buckets (8 * 24)
+        1;    // current_bucket_index
+    // Total: 250 bytes (+ 8 discriminator = 258 bytes for account)
+}
+
+/// PendingTokenRegistration - User-initiated registration request.
+/// Guardians observe these on-chain and decide whether to approve or reject.
+/// If approved: guardians submit register_token VAA.
+/// If rejected: no action taken, user can cancel to reclaim rent.
+#[account]
+pub struct PendingTokenRegistration {
+    pub mint: Pubkey,  // 32 bytes - The token mint requesting registration
+}
+
+impl PendingTokenRegistration {
+    pub const SIZE: usize = 32;  // mint only (+ 8 discriminator = 40 bytes for account)
 }
 
 #[error_code]
@@ -1792,4 +2395,22 @@ pub enum SimpleErr {
     BadAdminActionMarker,
     #[msg("Token price registry is full")]
     RegistryFull,
+    #[msg("Recipient is not a user wallet (must be owned by System Program)")]
+    InvalidRecipientType,
+    #[msg("Token not registered - must register via guardian VAA first")]
+    TokenNotRegistered,
+    #[msg("Token is delisted - new locks not allowed")]
+    TokenDelisted,
+    #[msg("Token is exit-only (tier 2) - only releases/mints allowed, no new locks/burns")]
+    TokenExitOnly,
+    #[msg("Bad token registration PDA")]
+    BadTokenRegistration,
+    #[msg("Invalid tier value - must be 0, 1, or 2")]
+    InvalidTier,
+    #[msg("Token already registered")]
+    TokenAlreadyRegistered,
+    #[msg("Per-token rate limit exceeded")]
+    TokenRateLimitExceeded,
+    #[msg("Invalid Zera address format - must be valid base58 characters")]
+    InvalidZeraAddressFormat,
 }
