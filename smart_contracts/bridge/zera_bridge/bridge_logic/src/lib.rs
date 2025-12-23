@@ -402,11 +402,14 @@ pub mod bridge_v1 {
                 smart_contracts::emit("Failed: Lock failed".to_string());
                 return;
             }
-
+            let usd_value = get_usd_value(amount.clone(), contract_id.clone());
+            let wallet_address = smart_contracts::wallet_address();
             smart_contracts::emit("EVENT:SEND_NATIVE_ZERA_TO_SOLANA".to_string());
             smart_contracts::emit(format!("contract_id: {}", contract_id.clone()));
             smart_contracts::emit(format!("amount: {}", amount.clone()));
             smart_contracts::emit(format!("solana_address: {}", solana_address.clone()));
+            smart_contracts::emit(format!("zera_address: {}", wallet_address.clone()));
+            smart_contracts::emit(format!("usd_value: {}", usd_value.clone()));
         }
     }
     //USER FACING FUNCTION
@@ -467,11 +470,13 @@ pub mod bridge_v1 {
                 return;
             }
 
+            let wallet_address = smart_contracts::wallet_address();
             smart_contracts::emit("EVENT:SEND_WRAPPED_SOLANA_TO_SOLANA".to_string());
             smart_contracts::emit(format!("contract_id: {}", contract_id.clone()));
             smart_contracts::emit(format!("amount: {}", amount.clone()));
             smart_contracts::emit(format!("solana_address: {}", solana_address.clone()));
             smart_contracts::emit(format!("mint_id: {}", mint_id.clone()));
+            smart_contracts::emit(format!("zera_address: {}", wallet_address.clone()));
         }
     }
     //PAYLOAD FUNCTION - mint already created solana coins on zera
