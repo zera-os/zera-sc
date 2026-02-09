@@ -71,7 +71,22 @@ Located in `smart_contracts/staking/`
   - `principle`: Manages staked principal amounts
   - `principle_proxy`: Proxy for principle management
 
-### 7. Bridge System
+### 7. DEX (Decentralized Exchange)
+Located in `smart_contracts/dex/`
+- **Purpose**: On-chain automated market maker (AMM) for permissionless token swaps
+- **Contracts**:
+  - `dex_factory` (zera_dex): Core DEX logic (pools, swaps, liquidity)
+  - `proxy` (zera_dex_proxy): Upgradeable proxy
+- **Features**:
+  - Constant product AMM formula (`x * y = k`)
+  - 7 configurable fee tiers (0.10% to 8.00%)
+  - LP token minting/burning for liquidity providers
+  - Optional LP token time-locking
+  - Platform fee support for aggregators (up to 5%)
+  - ACE price oracle integration for ZRA-paired pools
+  - Split fee model: treasury + LP rewards
+
+### 8. Bridge System
 Located in `smart_contracts/bridge/`
 - **Purpose**: Bidirectional cross-chain bridge between Zera Network and Solana
 - **Architecture**:
@@ -90,7 +105,7 @@ Located in `smart_contracts/bridge/`
   - Pause mechanism for emergency stops
   - Cross-chain governance coordination
 
-### 8. Treasury
+### 9. Treasury
 Located in `smart_contracts/treasury/`
 - **Purpose**: Central treasury for fund management
 - **Contracts**:
@@ -153,6 +168,7 @@ Proxy wallet addresses are hardcoded in each contract for security:
 - Early Backers Proxy: `AZfFcttA3nwqmEYzAtsmufops7PaxLYavvkkDRsxTX5j`
 - Principle Proxy: `8DABUMTHJtRXPTR4EkqHAYB6jW4XJy5F1YWNcFiSMDko`
 - Treasury: `4Yg2ZeYrzMjVBXvU2YWtuZ7CzWR9atnQCD35TQj1kKcH`
+- DEX Proxy: `3uct7y6rcxW3KA8o8b2gqtaygw7hA39P3SyjV466fXWP`
 - Bridge Proxy: `9fTYjLqHDqCmb1U71a6kRXEYNMwNvTF9xYX48HG4d1WA`
 
 ### Solana Network

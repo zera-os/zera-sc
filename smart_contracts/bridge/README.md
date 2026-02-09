@@ -632,11 +632,32 @@ SymbolConfig {
 
 **Pause Levels**:
 - **Level 0 (Active)**: All operations allowed
-- **Level 1 (IncomingOnly)**: Blocks outgoing transfers
-  - Zera: Blocks lock_zera, burn_sol
-  - Solana: Blocks lock_sol, lock_spl, burn_wrapped
+- **Level 1 (IncomingOnly)**: Blocks incoming transfers to that chain
+  - Zera: Blocks mint_sol, create_sol, release_zera (Solana → Zera)
+  - Solana: Blocks release_sol, release_spl, mint_wrapped (Zera → Solana)
 - **Level 2 (Complete)**: Blocks all transfers
-  - Both incoming and outgoing operations paused
+  - Both incoming and outgoing operations paused on that chain
+
+⚠️ **IMPORTANT: Pause States Are Chain-Independent**
+
+The pause state on each chain is **completely independent** and **not synchronized**:
+
+- Setting a pause on Solana does **NOT** automatically pause the Zera side
+- Setting a pause on Zera does **NOT** automatically pause the Solana side
+- Each chain maintains its own `pause_level` and `pause_expiry` values
+- Cross-chain pause coordination requires separate governance actions on each chain
+
+**Why This Matters**:
+- If Zera is paused at Level 1, incoming transfers to Zera (from Solana) are blocked
+- However, users can still initiate transfers FROM Zera TO Solana (outgoing from Zera)
+- These transfers will succeed on the Zera side but may fail on the Solana side if Solana is also paused
+- For a complete bridge halt, **both chains must be paused independently**
+
+**Coordinated Pause Flow**:
+1. Governance calls `pause()` on Zera bridge governance
+2. This emits `EVENT:PAUSE_SOLANA_BRIDGE` for guardians
+3. Guardians must separately execute the pause on Solana
+4. Until both chains are paused, transfers may partially succeed
 
 **Timed Pauses**:
 - Can set expiry timestamp
@@ -851,5 +872,3 @@ All fees are denominated in **USD equivalent** amounts that are converted to the
 **Pause Mechanism**: Emergency stop capability for security incidents
 **Replay Protection**: Prevents double-spending across chains
 **Hash Verification**: Ensures payload integrity
-
-

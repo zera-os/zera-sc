@@ -8,6 +8,8 @@ anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
 anchor-spl = { version = "0.31.1", features = ["token"] }
 mpl-token-metadata = { version = "5.0.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
+time = "=0.3.36"
+blake3 = "=1.5.4"
 
 [profile.release]
 overflow-checks = true
