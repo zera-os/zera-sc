@@ -1,4 +1,4 @@
-pub mod staking_v1 {
+pub mod staking_v2 {
     use base64::{decode, encode};
     use native_functions::zera::smart_contracts;
     use native_functions::zera::types;
@@ -25,8 +25,15 @@ pub mod staking_v1 {
     const REWARD_MANAGER_STATE_KEY: &str = "REWARD_MANAGER_STATE_";
     const WALLET_STAKES_KEY: &str = "WALLET_STAKES_";
     const ALL_STAKERS_KEY: &str = "ALL_STAKERS_";
+    const INSTANT_STAKES_KEY: &str = "INSTANT_STAKES_";
+    const ALL_INSTANT_STAKERS_KEY: &str = "ALL_INSTANT_STAKERS";
+    const MIGRATED_KEY: &str = "MIGRATED";
     const exploit_limit: u64 = 50_000_000_000_000; //50k ZRA
-    
+    const instant_stake_rate: u64 = 66666666666;
+    const instant_stake_const: u64 = 100000000000;
+    const PRINCIPLE_SEED: &str = "principle";
+    const PROXY_CONTRACT: &str = "staking_proxy_1";
+
     enum StakingType {
         SIX_MONTHS,
         ONE_YEAR,
@@ -51,34 +58,56 @@ pub mod staking_v1 {
         }
     }
 
-    fn get_reward(staking_type: String, principle: u64) -> (u64, u64) {
+    fn get_release_day(term: String) -> u64 {
+        unsafe {
+            let current_day: u64 = (smart_contracts::last_block_time() / 86400);
+
+            if term == StakingType::SIX_MONTHS.as_str() {
+                return current_day + 182;
+            } else if term == StakingType::ONE_YEAR.as_str() {
+                return current_day + 365;
+            } else if term == StakingType::TWO_YEARS.as_str() {
+                return current_day + 730;
+            } else if term == StakingType::THREE_YEARS.as_str() {
+                return current_day + 1095;
+            } else if term == StakingType::FOUR_YEARS.as_str() {
+                return current_day + 1460;
+            } else if term == StakingType::FIVE_YEARS.as_str() {
+                return current_day + 1825;
+            } else {
+                return 0;
+            }
+        }
+    }
+
+    fn get_reward(term: String, principle: u64) -> (u64, u64) {
         let mut total_reward: u64 = 0;
         let mut daily_release: u64 = 0;
 
-        if staking_type == StakingType::SIX_MONTHS.as_str() {
+        if term == StakingType::SIX_MONTHS.as_str() {
             let yearly_reward: u64 = (principle * 2) / 100;
             total_reward = yearly_reward / 2;
             daily_release = total_reward / 182;
-        } else if staking_type == StakingType::ONE_YEAR.as_str() {
+        } else if term == StakingType::ONE_YEAR.as_str() {
             total_reward = (principle * 6) / 100;
             daily_release = total_reward / 365;
-        } else if staking_type == StakingType::TWO_YEARS.as_str() {
+        } else if term == StakingType::TWO_YEARS.as_str() {
             let yearly_reward: u64 = (principle * 8) / 100;
             total_reward = yearly_reward * 2;
             daily_release = total_reward / 730;
-        } else if staking_type == StakingType::THREE_YEARS.as_str() {
+        } else if term == StakingType::THREE_YEARS.as_str() {
             let yearly_reward: u64 = (principle * 7) / 100;
             total_reward = yearly_reward * 3;
             daily_release = total_reward / 1095;
-        } else if staking_type == StakingType::FOUR_YEARS.as_str() {
+        } else if term == StakingType::FOUR_YEARS.as_str() {
             let yearly_reward: u64 = (principle * 7) / 100;
             total_reward = yearly_reward * 4;
             daily_release = total_reward / 1460;
-        } else if staking_type == StakingType::FIVE_YEARS.as_str() {
+        } else if term == StakingType::FIVE_YEARS.as_str() {
             let yearly_reward: u64 = (principle * 7) / 100;
             total_reward = yearly_reward * 5;
             daily_release = total_reward / 1825;
-        } else if staking_type == StakingType::LIQUID.as_str() {
+        } else if term == StakingType::LIQUID.as_str() {
             let yearly_reward: u64 = (principle * 1) / 1000;
             daily_release = yearly_reward / 365;
             total_reward = 0;
@@ -97,6 +126,14 @@ pub mod staking_v1 {
             if sc_wallet != PROXY_WALLET.to_string() {
                 return false;
             }
+
+            let migrated = smart_contracts::retrieve_state(MIGRATED_KEY.to_string());
+
+            if migrated != "true"{
+                smart_contracts::emit(format!("Failed: Not migrated"));
+                return false;
+            }
+
         }
         return true;
     }
@@ -122,7 +159,8 @@ pub mod staking_v1 {
                         .total_reward
                         .saturating_sub(staker_state.total_released);
                     if finish_release > 0 {
-                        wallets_released_map.insert(staker_state.staker_address.clone(), finish_release);
+                        wallets_released_map
+                            .insert(staker_state.staker_address.clone(), finish_release);
                         *input_amount += finish_release;
                     }
                     continue;
@@ -151,93 +189,94 @@ pub mod staking_v1 {
         current_day: u64,
         allowed_liquid_release: u64,
     ) -> (AllWalletStakes, u64, u64, u64) {
-        unsafe{
-        let mut total_amount: u64 = 0;
-        let mut principle_release: u64 = 0;
+        unsafe {
+            let mut total_amount: u64 = 0;
+            let mut principle_release: u64 = 0;
 
-        let mut new_wallet_stakes: AllWalletStakes = AllWalletStakes {
-            staker_states: HashMap::new(),
-            liquid_stake: wallet_stake.liquid_stake,
-        };
-
-        for (id_str, stake) in &wallet_stake.staker_states {
-            let mut new_stake = WalletStake {
-                principle: stake.principle,
-                total_reward: stake.total_reward,
-                daily_release: stake.daily_release,
-                total_released: stake.total_released,
-                last_reward_day: stake.last_reward_day,
+            let mut new_wallet_stakes: AllWalletStakes = AllWalletStakes {
+                staker_states: HashMap::new(),
+                liquid_stake: wallet_stake.liquid_stake,
             };
 
-            let day_diff: u64 = current_day.saturating_sub(new_stake.last_reward_day);
+            for (id_str, stake) in &wallet_stake.staker_states {
+                let mut new_stake = WalletStake {
+                    principle: stake.principle,
+                    total_reward: stake.total_reward,
+                    daily_release: stake.daily_release,
+                    total_released: stake.total_released,
+                    last_reward_day: stake.last_reward_day,
+                    term: stake.term.clone(),
+                };
 
-            if day_diff == 0 {
+                let day_diff: u64 = current_day.saturating_sub(new_stake.last_reward_day);
+
+                if day_diff == 0 {
+                    new_wallet_stakes
+                        .staker_states
+                        .insert(id_str.clone(), new_stake);
+                    continue;
+                }
+
+                let daily_release: u64 = stake.daily_release.saturating_mul(day_diff);
+                let total_released: u64 = stake.total_released.saturating_add(daily_release);
+
+                if total_released > new_stake.total_reward {
+                    let finish_release: u64 = new_stake
+                        .total_reward
+                        .saturating_sub(new_stake.total_released);
+
+                    if finish_release > 0 {
+                        total_amount += finish_release;
+                    }
+
+                    principle_release += new_stake.principle;
+                    continue;
+                }
+
+                total_amount += daily_release;
+                new_stake.last_reward_day = current_day;
+                new_stake.total_released = total_released;
                 new_wallet_stakes
                     .staker_states
                     .insert(id_str.clone(), new_stake);
-                continue;
             }
 
-            let daily_release: u64 = stake.daily_release.saturating_mul(day_diff);
-            let total_released: u64 = stake.total_released.saturating_add(daily_release);
+            let mut liquid_release: u64 = 0;
+            let day_diff: u64 =
+                current_day.saturating_sub(new_wallet_stakes.liquid_stake.last_reward_day);
 
-            if total_released > new_stake.total_reward {
-                let finish_release: u64 = new_stake
-                    .total_reward
-                    .saturating_sub(new_stake.total_released);
-
-                if finish_release > 0 {
-                    total_amount += finish_release;
+            if new_wallet_stakes.liquid_stake.bump_id != 0 && day_diff > 0 {
+                let mut daily_release: u64 = new_wallet_stakes
+                    .liquid_stake
+                    .daily_release
+                    .saturating_mul(day_diff);
+                let mut release_principle = false;
+                if daily_release > allowed_liquid_release {
+                    daily_release = allowed_liquid_release;
+                    release_principle = true;
                 }
 
-                principle_release += new_stake.principle;
-                continue;
+                total_amount += daily_release;
+                liquid_release += daily_release;
+                new_wallet_stakes.liquid_stake.last_reward_day = current_day;
+
+                if release_principle || new_wallet_stakes.liquid_stake.unstake_day <= current_day {
+                    principle_release += new_wallet_stakes.liquid_stake.principle;
+                    new_wallet_stakes.liquid_stake.bump_id = 0;
+                    new_wallet_stakes.liquid_stake.principle = 0;
+                    new_wallet_stakes.liquid_stake.last_reward_day = 0;
+                    new_wallet_stakes.liquid_stake.daily_release = 0;
+                    new_wallet_stakes.liquid_stake.unstake_day = 0;
+                }
             }
 
-            total_amount += daily_release;
-            new_stake.last_reward_day = current_day;
-            new_stake.total_released = total_released;
-            new_wallet_stakes
-                .staker_states
-                .insert(id_str.clone(), new_stake);
+            (
+                new_wallet_stakes,
+                total_amount,
+                principle_release,
+                liquid_release,
+            )
         }
-
-        let mut liquid_release: u64 = 0;
-        let day_diff: u64 =
-            current_day.saturating_sub(new_wallet_stakes.liquid_stake.last_reward_day);
-
-        if new_wallet_stakes.liquid_stake.bump_id != 0 && day_diff > 0 {
-            let mut daily_release: u64 = new_wallet_stakes
-                .liquid_stake
-                .daily_release
-                .saturating_mul(day_diff);
-            let mut release_principle = false;
-            if daily_release > allowed_liquid_release {
-                daily_release = allowed_liquid_release;
-                release_principle = true;
-            }
-
-            total_amount += daily_release;
-            liquid_release += daily_release;
-            new_wallet_stakes.liquid_stake.last_reward_day = current_day;
-
-            if release_principle || new_wallet_stakes.liquid_stake.unstake_day <= current_day {
-                principle_release += new_wallet_stakes.liquid_stake.principle;
-                new_wallet_stakes.liquid_stake.bump_id = 0;
-                new_wallet_stakes.liquid_stake.principle = 0;
-                new_wallet_stakes.liquid_stake.last_reward_day = 0;
-                new_wallet_stakes.liquid_stake.daily_release = 0;
-                new_wallet_stakes.liquid_stake.unstake_day = 0;
-            }
-        }
-
-        (
-            new_wallet_stakes,
-            total_amount,
-            principle_release,
-            liquid_release,
-        )
-    }
     }
 
     fn process_all_wallet_stakes(
@@ -266,9 +305,8 @@ pub mod staking_v1 {
 
                 let (new_wallet_stakes, total_amount_released, principle_release, liquid_release) =
                     process_wallet_stakes(wallet_stakes, current_day, allowed_release);
-                
-                if total_amount_released > 0 {
 
+                if total_amount_released > 0 {
                     let actual_amount = total_amount_released.saturating_add(principle_release);
 
                     if let Some(existing_amount) = wallets_released_map.get_mut(wallet_address) {
@@ -298,216 +336,99 @@ pub mod staking_v1 {
     }
 
     #[wasmedge_bindgen]
-    pub fn init() {
+    pub fn init() {}
+
+    #[wasmedge_bindgen]
+    pub fn init_v2() {
         unsafe {
-            //1000000000000000000 = 1$ from get_ace_data
-            let (authorized, rate) = smart_contracts::get_ace_data(ZRA_CONTRACT.to_string());
-            let denomination = smart_contracts::contract_denomination(ZRA_CONTRACT.to_string());
-            let one_dolla = types::string_to_u256("10000000000000000000".to_string()); //10$
-            let one_dolla_zera = (one_dolla * denomination) / rate;
-            smart_contracts::hold(ZRA_CONTRACT.to_string(), one_dolla_zera.to_string());
+            let sc_wallet_ = smart_contracts::called_smart_contract_wallet();
+            let sc_wallet = sc_wallet_.clone();
 
-            let staker_state = EarlyStakerState {
-                bump_id: 1,
-                staker_address: "78zRexAX5x5eeZQC1ubACexckAhHYj4tZ65KqNiPzrPx".to_string(),
-                total_reward: 281_500_000,  //0.8445 ZRA
-                daily_release: 77_123, //0.000077123 ZRA
-                total_released: 0,
-            };
+            if sc_wallet != PROXY_WALLET.to_string() {
+                return;
+            }
 
-            let staker_state2 = EarlyStakerState {
-                bump_id: 2,
-                staker_address: "7Ua66538h9tXfxjxuraBDxLMBTetJdvCffdixsX8TXp3".to_string(),
-                total_reward: 499_999_718_500_000, //499,999.718500000 ZRA
-                daily_release: 136_986_224_247,    //136.986224247 ZRA
-                total_released: 0,
-            };
+            let migrated = smart_contracts::retrieve_state(MIGRATED_KEY.to_string());
 
-            let staker_state3 = EarlyStakerState {
-                bump_id: 3,
-                staker_address: "Gi44BJYMcoZV3C2aq9qAuAaLPDPPknHgJr4BH1xAoYAD".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
+            if migrated == "true"{
+                smart_contracts::emit(format!("Failed: Already migrated"));
+                return;
+            }
 
-            let staker_state4 = EarlyStakerState {
-                bump_id: 4,
-                staker_address: "5unPPFqyqw3CsVc37ryFdHg3fBuhKkwkLpScg9MVWox3".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
+            let wallet_balance = smart_contracts::wallet_balance(
+                ZRA_CONTRACT.to_string(),
+                PRINCIPLE_WALLET.to_string(),
+            );
 
-            let staker_state5 = EarlyStakerState {
-                bump_id: 5,
-                staker_address: "CsVwuWk9qPpdX63WiBGc1W1jzCYNBH4EL7yi21nvyN5i".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state6 = EarlyStakerState {
-                bump_id: 6,
-                staker_address: "6AyyJjviUxuX1TyAeLrZ36jwtVuLBMW44pEXRrQb1Vea".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state7 = EarlyStakerState {
-                bump_id: 7,
-                staker_address: "9JSFFjSoNim5rWTQHTEkeEmrf99wrc7TFqWxvp2LkWtF".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state8 = EarlyStakerState {
-                bump_id: 8,
-                staker_address: "DFJSJ7E87STGxrQDC7RJHezCTvHHmRqH47GeEABKc6xQ".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state9 = EarlyStakerState {
-                bump_id: 9,
-                staker_address: "3JFXob4qg1JBMLbFbp5SjnugHntNSYxtC45pd298AjTB".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state10 = EarlyStakerState {
-                bump_id: 10,
-                staker_address: "5sA7vapneGVcAibBwxuwuYg3FRo77Pf9u2hrUGteDG5m".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state11 = EarlyStakerState {
-                bump_id: 11,
-                staker_address: "6m3QMTYYkW9B8JVwKMxyYFqVngsRyPgRgm9yAR7R6woh".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state12 = EarlyStakerState {
-                bump_id: 12,
-                staker_address: "9XUYp3ge65XUrgHtwBqMBzQAZRHsNRNSd7T9AvzK7wEp".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state13 = EarlyStakerState {
-                bump_id: 13,
-                staker_address: "4HAsai4AosHJepYjYC8cPFKTy8tSB23AGgL5tyRxuZTJ".to_string(),
-                total_reward: 500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release:  136_986_301_370, //136.986301370 ZRA
-                total_released: 0,
-            };
-            let staker_state14 = EarlyStakerState {
-                bump_id: 14,
-                staker_address: "EcUvQZmmpcJmT53qpYf9xsBS5VZa7dhcsFSYuJQvBrg1".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state15 = EarlyStakerState {
-                bump_id: 15,
-                staker_address: "GNxvzat9VwAR5QoUXrKkefhUqKkcSjHPKpvamcPDytdQ".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state16 = EarlyStakerState {
-                bump_id: 16,
-                staker_address: "HWFQfKEZhQABU47CpL526HRo9fqwNY6mPwXJT1mcGXNN".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state17 = EarlyStakerState {
-                bump_id: 17,
-                staker_address: "64HK78NEqd35oSLdDrjoGaegUqjp6uLDD6APQK2AsFTY".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state18 = EarlyStakerState {
-                bump_id: 18,
-                staker_address: "4tHs1nRxZjoSxjFZSjxqtTNcwgRbiHo2ZcLdh8p71YRz".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state19 = EarlyStakerState {
-                bump_id: 19,
-                staker_address: "CrV4uLsan9DsKdrxSWia5L79cxgMvzn3fycw3VvtsNQe".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state20 = EarlyStakerState {
-                bump_id: 20,
-                staker_address: "84SFrLu1YXjZWHZg5NEuu52sm5mJn14Kmt4iWk5LULhR".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state21 = EarlyStakerState {
-                bump_id: 21,
-                staker_address: "Dk6ARnKukexf4PxaLPSyHRt54XYrH3uHAsvPAU5PxQXS".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state22 = EarlyStakerState {
-                bump_id: 22,
-                staker_address: "DaQeaGGzhvnZKFRSJxkt5k1FriVjsW1N646ktu7nEiMp".to_string(),
-                total_reward: 1_000_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 273_972_602_740, //273.972602740 ZRA
-                total_released: 0,
-            };
-            let staker_state23 = EarlyStakerState {
-                bump_id: 23,
-                staker_address: "B5iydRRGZ5higjKWMVGyxbGY56pQfvSHBST9jdRAiTgA".to_string(),
-                total_reward: 2_500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 684_931_506_849, //684.931506849 ZRA
-                total_released: 0,
-            };
-            let staker_state24 = EarlyStakerState {
-                bump_id: 24,
-                staker_address: "2tjKdQyJhkn4YPCfRnW7j1R1FEyKsCByrC87hjngqSWs".to_string(),
-                total_reward: 2_500_000_000_000_000, //500,000.000000000 ZRA
-                daily_release: 684_931_506_849, //684.931506849 ZRA
-                total_released: 0,
-            };
-            let staker_state25 = EarlyStakerState {
-                bump_id: 25,
-                staker_address: "93iQs6VkGWgyVcwyL28HHRVeqiZB5WHpvtCVkaXUnvoV".to_string(),
-                total_reward: 5_000_000_000_000_000, //10,000,000.000000000 ZRA
-                daily_release: 1_369_863_013_699, //1,369.863013699 ZRA
-                total_released: 0,
-            };
+            let parameters_vec: Vec<String> =
+                [PRINCIPLE_FUNCTION.to_string(), wallet_balance.to_string()].to_vec();
 
-            let all_staker_state = AllEarlyStakerStates {
-                staker_states: vec![staker_state, staker_state2, staker_state3, staker_state4, staker_state5, staker_state6, staker_state7, staker_state8, staker_state9, staker_state10, staker_state11, staker_state12, staker_state13, staker_state14, staker_state15, staker_state16, staker_state17, staker_state18, staker_state19, staker_state20, staker_state21, staker_state22, staker_state23, staker_state24, staker_state25],
-            };
+            let results = smart_contracts::delegatecall(
+                PRINCIPLE_PROXY_CONTRACT.to_string(),
+                PRINCIPLE_PROXY_INSTANCE.to_string(),
+                PRINCIPLE_PROXY_FUNCTION.to_string(),
+                parameters_vec.clone(),
+            );
 
-            save_state(EARLY_STAKER_STATE_KEY, &all_staker_state);
+            for result in results {
+                if result != "OK" {
+                    let emit1 = format!("Failed to release principle");
+                    smart_contracts::emit(emit1.clone());
+                    return;
+                }
+            }
 
-            let last_reward_time = smart_contracts::last_block_time();
+            let derived_wallet = smart_contracts::derive_wallet(PRINCIPLE_SEED.to_string());
 
-            let last_reward_day: u64 = (last_reward_time / 86400);
+            if !smart_contracts::send(
+                ZRA_CONTRACT.to_string(),
+                wallet_balance.to_string(),
+                derived_wallet.clone(),
+            ) {
+                panic!("Failed to send");
+            }
 
-            let reward_manager_state = RewardManagerState {
-                last_reward_day: last_reward_day,
-                total_supply: 40_000_000_000_000_000, //40m ZRA
-                used_supply: 25_000_000_000_000_000,  //25m ZRA
-                exploit: false,
-            };
+            let (keys, values) = smart_contracts::get_all_states("staking_v1".to_string(), "1".to_string());
 
-            let id_bump_state = IdBumpState { id: 26 };
-            save_state(ID_BUMP_KEY, &id_bump_state);
+            for (key, value) in keys.iter().zip(values.iter()) {
+                smart_contracts::delegate_store_state(key.clone(), value.clone(), PROXY_CONTRACT.to_string());
+            }
 
-            save_state(REWARD_MANAGER_STATE_KEY, &reward_manager_state);
+            let all_wallet_stakes: AllStakers = load_state(ALL_STAKERS_KEY).unwrap();
+            for (wallet_address, _) in &all_wallet_stakes.staker_states {
+                let wallet_stake_key = format!("{}_{}", WALLET_STAKES_KEY, wallet_address.clone());
+                let mut wallet_stakes: OldAllWalletStakes = load_state(&wallet_stake_key).unwrap();
+                let mut new_wallet_stakes: AllWalletStakes = AllWalletStakes {
+                    staker_states: HashMap::new(),
+                    liquid_stake: LiquidStake {
+                        bump_id: 0,
+                        principle: 0,
+                        last_reward_day: 0,
+                        daily_release: 0,
+                        unstake_day: 0,
+                    },
+                };
+
+                for (id, stake) in &wallet_stakes.staker_states {
+                    let mut new_stake: WalletStake = WalletStake {
+                        principle: stake.principle,
+                        total_reward: stake.total_reward,
+                        daily_release: stake.daily_release,
+                        total_released: stake.total_released,
+                        last_reward_day: stake.last_reward_day,
+                        term: "5_years".to_string(),
+                    };
+                    new_wallet_stakes.staker_states.insert(id.clone(), new_stake);
+                }
+                save_state(&wallet_stake_key, &new_wallet_stakes);
+            }
+
+            if !smart_contracts::store_state(MIGRATED_KEY.to_string(), "true".to_string())
+            {
+                panic!("Failed to store migrated state");
+            }
+
+            smart_contracts::emit(format!("Success: Principle sent to derived wallet, and staking v1 states migrated"));
         }
     }
 
@@ -519,7 +440,8 @@ pub mod staking_v1 {
             }
 
             let current_day: u64 = smart_contracts::last_block_time() / 86400 as u64;
-            let mut reward_manager_state: RewardManagerState = load_state(REWARD_MANAGER_STATE_KEY).unwrap();
+            let mut reward_manager_state: RewardManagerState =
+                load_state(REWARD_MANAGER_STATE_KEY).unwrap();
 
             if reward_manager_state.exploit {
                 return;
@@ -538,11 +460,8 @@ pub mod staking_v1 {
             let mut input_amount: u64 = 0;
             let mut remove_wallet = Vec::<String>::new();
 
-            let (new_staker_states) = process_early_staking(
-                days_elapsed,
-                &mut wallets_released_map,
-                &mut input_amount,
-            );
+            let (new_staker_states) =
+                process_early_staking(days_elapsed, &mut wallets_released_map, &mut input_amount);
 
             let allowed_liquid_release = reward_manager_state
                 .total_supply
@@ -573,27 +492,18 @@ pub mod staking_v1 {
                 .saturating_add(total_liquid_released);
 
             if total_principle_amount > 0 {
-                let parameters_vec: Vec<String> = [
-                    PRINCIPLE_FUNCTION.to_string(),
+                let derived_wallet = smart_contracts::derive_wallet(PRINCIPLE_SEED.to_string());
+
+                if !smart_contracts::derived_send(
+                    ZRA_CONTRACT.to_string(),
                     total_principle_amount.to_string(),
-                ]
-                .to_vec();
-
-                let results = smart_contracts::delegatecall(
-                    PRINCIPLE_PROXY_CONTRACT.to_string(),
-                    PRINCIPLE_PROXY_INSTANCE.to_string(),
-                    PRINCIPLE_PROXY_FUNCTION.to_string(),
-                    parameters_vec.clone(),
-                );
-
-                for result in results {
-                    if result != "OK" {
-                        let emit1 = format!("Failed to release principle");
-                        smart_contracts::emit(emit1.clone());
-                        return;
-                    }
+                    PROXY_WALLET.to_string(),
+                    derived_wallet.clone(),
+                ) {
+                    panic!("Failed to send");
                 }
             }
+
             let mut amounts_released = Vec::<String>::new();
             let mut wallets_released = Vec::<String>::new();
 
@@ -608,18 +518,7 @@ pub mod staking_v1 {
                 amounts_released,
                 wallets_released,
             ) {
-                if !smart_contracts::send(
-                    ZRA_CONTRACT.to_string(),
-                    total_principle_amount.to_string(),
-                    PRINCIPLE_WALLET.to_string(),
-                ) {
-                    let emit1 = format!("Failed: Unable to send multi or refund principle");
-                    smart_contracts::emit(emit1.clone());
-                } else {
-                    let emit1 = format!("Failed: Unable to send multi. Successfully refunded principle back to principle proxy.");
-                    smart_contracts::emit(emit1.clone());
-                }
-                return;
+                panic!("Failed to send multi");
             }
 
             let mut new_all_stakers: AllStakers = AllStakers {
@@ -640,23 +539,253 @@ pub mod staking_v1 {
             }
 
             reward_manager_state.last_reward_day = current_day;
+
             save_state(REWARD_MANAGER_STATE_KEY, &reward_manager_state);
             save_state(EARLY_STAKER_STATE_KEY, &new_staker_states);
             save_state(ALL_STAKERS_KEY, &new_all_stakers);
 
-            let emit1 = format!("Success: Rewards sent to stakers");
-            smart_contracts::emit(emit1.clone());
+            smart_contracts::emit(format!("Success: Rewards sent to stakers"));
         }
     }
 
     #[wasmedge_bindgen]
-    pub fn stake(amount: String, wallet_address: String, staking_type: String) {
+    pub fn instant_stake(amount: String, term: String) {
         unsafe {
             if !check_auth() {
                 return;
             }
 
-            let mut reward_manager_state: RewardManagerState = load_state(REWARD_MANAGER_STATE_KEY).unwrap();
+            let mut reward_manager_state: RewardManagerState =
+                load_state(REWARD_MANAGER_STATE_KEY).unwrap();
+
+            if reward_manager_state.exploit {
+                return;
+            }
+
+            if !types::is_valid_u256(amount.to_string()) {
+                return;
+            }
+
+            if term == StakingType::LIQUID.as_str() {
+                return;
+            }
+
+            let principle = types::string_to_u256(amount.clone()).low_u64();
+            let mut return_id: u64 = 0;
+
+            let (mut total_reward, daily_release) = get_reward(term.clone(), principle);
+
+            if total_reward == 0 && daily_release == 0 {
+                return;
+            }
+
+            let mut release_day = get_release_day(term.clone());
+
+            if release_day == 0 {
+                return;
+            }
+
+            let wallet_address = smart_contracts::wallet_address();
+
+            let instant_stake_percent: U256 = U256::from(instant_stake_rate);
+            let instant_stake_constant: U256 = U256::from(instant_stake_const);
+            let mut instant_stake_reward: U256 = U256::from(total_reward);
+            instant_stake_reward = (instant_stake_reward * instant_stake_percent) / instant_stake_constant;
+
+            if instant_stake_reward == U256::from(0) {
+                smart_contracts::emit(format!("Failed: Instant stake reward is 0"));
+                return;
+            }
+
+            total_reward = instant_stake_reward.to_string().parse::<u64>().unwrap();
+
+            let used_supply: u64 = reward_manager_state.used_supply + total_reward;
+
+            if used_supply > reward_manager_state.total_supply {
+                smart_contracts::emit(format!(
+                    "Failed: Insufficient supply: {} > {}",
+                    used_supply.to_string(),
+                    reward_manager_state.total_supply.to_string()
+                ));
+                return;
+            }
+
+            reward_manager_state.used_supply = used_supply;
+            let derived_wallet = smart_contracts::derive_wallet(PRINCIPLE_SEED.to_string());
+
+            if !smart_contracts::transfer(
+                ZRA_CONTRACT.to_string(),
+                principle.to_string(),
+                derived_wallet.to_string(),
+            ) {
+                return;
+            }
+
+            let instant_stake_key = format!("{}_{}", INSTANT_STAKES_KEY, wallet_address.clone());
+            let mut instant_stakes: AllWalletInstantStakes = load_state(&instant_stake_key)
+                .unwrap_or(AllWalletInstantStakes {
+                    staker_states: HashMap::new(),
+                });
+
+            let mut id_bump_state: IdBumpState = load_state(ID_BUMP_KEY).unwrap();
+
+            instant_stakes.staker_states.insert(
+                id_bump_state.id.to_string(),
+                InstantStake {
+                    principle: principle,
+                    total_reward: total_reward,
+                    release_day: release_day,
+                    term: term.clone(),
+                },
+            );
+
+            return_id = id_bump_state.id;
+            id_bump_state.id = id_bump_state.id + 1;
+
+            let mut all_instant_stakers: AllInstantStakers = load_state(ALL_INSTANT_STAKERS_KEY)
+                .unwrap_or(AllInstantStakers {
+                    staker_states: HashMap::new(),
+                    earliest_release_day: u64::MAX,
+                });
+
+            all_instant_stakers
+                .staker_states
+                .insert(wallet_address.clone(), 1);
+
+            if release_day < all_instant_stakers.earliest_release_day {
+                all_instant_stakers.earliest_release_day = release_day;
+            }
+
+            if !smart_contracts::send(
+                ZRA_CONTRACT.to_string(),
+                total_reward.to_string(),
+                wallet_address.clone(),
+            ) {
+                panic!("Failed to send reward.");
+            }
+
+            save_state(REWARD_MANAGER_STATE_KEY, &reward_manager_state);
+            save_state(ID_BUMP_KEY, &id_bump_state);
+            save_state(ALL_INSTANT_STAKERS_KEY, &all_instant_stakers);
+            save_state(&instant_stake_key, &instant_stakes);
+
+            smart_contracts::emit("INSTANT_STAKE_SUCCESS".to_string());
+            smart_contracts::emit(format!("wallet: {}", wallet_address));
+            smart_contracts::emit(format!("term: {}", term));
+            smart_contracts::emit(format!("bump_id: {}", return_id));
+        }
+    }
+
+    #[wasmedge_bindgen]
+    pub fn release_instant() {
+        unsafe {
+            if !check_auth() {
+                return;
+            }
+
+            let reward_manager_state: RewardManagerState =
+                load_state(REWARD_MANAGER_STATE_KEY).unwrap();
+
+            if reward_manager_state.exploit {
+                return;
+            }
+            let mut all_instant_stakers: AllInstantStakers =
+                load_state(ALL_INSTANT_STAKERS_KEY).unwrap();
+
+            let current_day: u64 = (smart_contracts::last_block_time() / 86400);
+
+            if current_day < all_instant_stakers.earliest_release_day {
+                let release_day = all_instant_stakers.earliest_release_day - current_day;
+                smart_contracts::emit(format!("Failed: Not enough time has passed to release instant stakes, {} days remaining", release_day));
+                return;
+            }
+            let mut wallets_to_release: Vec<String> = Vec::new();
+            let mut amounts_released: Vec<String> = Vec::new();
+            let mut total_amount: u64 = 0;
+
+            let mut new_all_instant_stakers: AllInstantStakers = AllInstantStakers {
+                staker_states: HashMap::new(),
+                earliest_release_day: u64::MAX,
+            };
+
+            for (wallet_address, _) in all_instant_stakers.staker_states.iter() {
+                //get all instant stakes for the wallet
+                let instant_stake_key =
+                    format!("{}_{}", INSTANT_STAKES_KEY, wallet_address.to_string());
+                let mut instant_stakes: AllWalletInstantStakes =
+                    load_state(&instant_stake_key).unwrap();
+
+                //create new instant stakes for the wallet, reconstruct new instant stakes
+                let mut new_instant_stakes: AllWalletInstantStakes = AllWalletInstantStakes {
+                    staker_states: HashMap::new(),
+                };
+
+                for (id_str, stake) in &instant_stakes.staker_states {
+                    //if the stake is ready to be released, add to the lists
+                    //else, add back to the new instant stakes
+                    if stake.release_day <= current_day {
+                        wallets_to_release.push(wallet_address.to_string());
+                        amounts_released.push(stake.principle.to_string());
+                        total_amount += stake.principle;
+                    } else {
+                        new_instant_stakes.staker_states.insert(
+                            id_str.clone(),
+                            InstantStake {
+                                principle: stake.principle,
+                                total_reward: stake.total_reward,
+                                release_day: stake.release_day,
+                                term: stake.term.clone(),
+                            },
+                        );
+
+                        if stake.release_day < new_all_instant_stakers.earliest_release_day {
+                            new_all_instant_stakers.earliest_release_day = stake.release_day;
+                        }
+                    }
+                }
+
+                if !new_instant_stakes.staker_states.is_empty() {
+                    new_all_instant_stakers
+                        .staker_states
+                        .insert(wallet_address.to_string(), 1);
+                    save_state(&instant_stake_key, &new_instant_stakes);
+                } else {
+                    smart_contracts::clear_state(instant_stake_key.clone());
+                }
+            }
+
+            if total_amount == 0 {
+                return;
+            }
+
+            let derived_wallet = smart_contracts::derive_wallet(PRINCIPLE_SEED.to_string());
+
+            if !smart_contracts::derived_send_multi(
+                ZRA_CONTRACT.to_string(),
+                total_amount.to_string(),
+                amounts_released,
+                wallets_to_release,
+                derived_wallet.clone(),
+            ) {
+                panic!("Failed to send multi");
+            }
+
+            save_state(ALL_INSTANT_STAKERS_KEY, &new_all_instant_stakers);
+
+            smart_contracts::emit("INSTANT_STAKE_RELEASED".to_string());
+            smart_contracts::emit(format!("total_amount_released: {}", total_amount));
+        }
+    }
+
+    #[wasmedge_bindgen]
+    pub fn stake(amount: String, wallet_address: String, term: String) {
+        unsafe {
+            if !check_auth() {
+                return;
+            }
+
+            let mut reward_manager_state: RewardManagerState =
+                load_state(REWARD_MANAGER_STATE_KEY).unwrap();
 
             if reward_manager_state.exploit {
                 return;
@@ -668,15 +797,15 @@ pub mod staking_v1 {
 
             let principle: u64 = amount.parse::<u64>().unwrap();
 
-            let (total_reward, daily_release) = get_reward(staking_type.clone(), principle);
+            let (total_reward, daily_release) = get_reward(term.clone(), principle);
 
             if total_reward == 0 && daily_release == 0 {
                 return;
             }
-
+            let derived_wallet = smart_contracts::derive_wallet(PRINCIPLE_SEED.to_string());
             let mut return_id = 0;
 
-            if staking_type != StakingType::LIQUID.as_str() {
+            if term != StakingType::LIQUID.as_str() {
                 let used_supply: u64 = reward_manager_state.used_supply + total_reward;
 
                 if used_supply > reward_manager_state.total_supply {
@@ -686,11 +815,10 @@ pub mod staking_v1 {
                 }
 
                 reward_manager_state.used_supply = used_supply;
-
                 if !smart_contracts::transfer(
                     ZRA_CONTRACT.to_string(),
                     principle.to_string(),
-                    PRINCIPLE_WALLET.to_string(),
+                    derived_wallet.to_string(),
                 ) {
                     return;
                 }
@@ -721,6 +849,7 @@ pub mod staking_v1 {
                         daily_release: daily_release,
                         total_released: 0,
                         last_reward_day: last_reward_time,
+                        term: term.clone(),
                     },
                 );
 
@@ -739,15 +868,13 @@ pub mod staking_v1 {
                 save_state(ID_BUMP_KEY, &id_bump_state);
                 save_state(&wallet_stake_key, &wallet_stakes);
             } else {
-
                 if !smart_contracts::transfer(
                     ZRA_CONTRACT.to_string(),
                     principle.to_string(),
-                    PRINCIPLE_WALLET.to_string(),
+                    derived_wallet.to_string(),
                 ) {
                     return;
                 }
-
 
                 let mut id_bump_state: IdBumpState = load_state(ID_BUMP_KEY).unwrap();
 
@@ -786,8 +913,10 @@ pub mod staking_v1 {
                 save_state(ALL_STAKERS_KEY, &all_stakers);
             }
 
-            let emit1 = format!("Success: Wallet {} Staked {} with id {}", wallet_address.clone(), staking_type.clone(), return_id.to_string().clone());
-            smart_contracts::emit(emit1.clone());
+            smart_contracts::emit("STAKE_SUCCESS".to_string());
+            smart_contracts::emit(format!("wallet: {}", wallet_address));
+            smart_contracts::emit(format!("term: {}", term));
+            smart_contracts::emit(format!("return_id: {}", return_id));
         }
     }
 
@@ -798,8 +927,9 @@ pub mod staking_v1 {
                 return;
             }
 
-            let mut reward_manager_state: RewardManagerState = load_state(REWARD_MANAGER_STATE_KEY).unwrap();
-            
+            let mut reward_manager_state: RewardManagerState =
+                load_state(REWARD_MANAGER_STATE_KEY).unwrap();
+
             if reward_manager_state.exploit {
                 return;
             }
@@ -829,11 +959,9 @@ pub mod staking_v1 {
 
             save_state(&wallet_stake_key, &wallet_stakes);
 
-            let emit1 = format!(
-                "Success: Liquid stake will be released in 14 days for wallet: {}",
-                sender_wallet.clone()
-            );
-            smart_contracts::emit(emit1.clone());
+            smart_contracts::emit("LIQUID_STAKE_RELEASED".to_string());
+            smart_contracts::emit(format!("wallet: {}", sender_wallet));
+            smart_contracts::emit("days_until_release: 14".to_string());
         }
     }
 
@@ -848,7 +976,8 @@ pub mod staking_v1 {
                 return;
             }
 
-            let mut reward_manager_state: RewardManagerState = load_state(REWARD_MANAGER_STATE_KEY).unwrap();
+            let mut reward_manager_state: RewardManagerState =
+                load_state(REWARD_MANAGER_STATE_KEY).unwrap();
 
             if reward_manager_state.exploit {
                 return;
@@ -894,6 +1023,7 @@ pub mod staking_v1 {
 
             // Check if the stake exists
             if let Some(stake) = wallet_stakes.staker_states.get(&bump_id.to_string()) {
+                let stake_term = stake.term.clone();
                 // stake exists, use it
                 let updated_stake_key = format!("{}_{}", WALLET_STAKES_KEY, wallet_address.clone());
                 let mut updated_wallet_stakes: AllWalletStakes = load_state(&updated_stake_key)
@@ -926,16 +1056,16 @@ pub mod staking_v1 {
                 save_state(ALL_STAKERS_KEY, &all_stakers);
                 save_state(&updated_stake_key, &updated_wallet_stakes);
                 save_state(&wallet_stake_key, &wallet_stakes);
-                let emit1 = format!(
-                    "Success: Stake id {} updated for wallet: {}",
-                    bump_id.clone(),
-                    wallet_address.clone()
-                );
-                smart_contracts::emit(emit1.clone());
+                smart_contracts::emit("STAKE_UPDATED".to_string());
+                smart_contracts::emit(format!("old_wallet: {}", sender_wallet));
+                smart_contracts::emit(format!("new_wallet: {}", wallet_address));
+                smart_contracts::emit(format!("term: {}", stake_term));
+                smart_contracts::emit(format!("bump_id: {}", bump_id));
                 return;
             } else {
                 if wallet_stakes.liquid_stake.bump_id == bump_id.parse::<u64>().unwrap() {
-                    let updated_stake_key = format!("{}_{}", WALLET_STAKES_KEY, wallet_address.clone());
+                    let updated_stake_key =
+                        format!("{}_{}", WALLET_STAKES_KEY, wallet_address.clone());
                     let mut updated_wallet_stakes: AllWalletStakes = load_state(&updated_stake_key)
                         .unwrap_or(AllWalletStakes {
                             staker_states: HashMap::new(),
@@ -949,11 +1079,13 @@ pub mod staking_v1 {
                         });
 
                     updated_wallet_stakes.liquid_stake.bump_id = bump_id.parse::<u64>().unwrap();
-                    updated_wallet_stakes.liquid_stake.principle += wallet_stakes.liquid_stake.principle;
-                    updated_wallet_stakes.liquid_stake.last_reward_day = smart_contracts::last_block_time() / 86400;
-                    updated_wallet_stakes.liquid_stake.daily_release += wallet_stakes.liquid_stake.daily_release;
+                    updated_wallet_stakes.liquid_stake.principle +=
+                        wallet_stakes.liquid_stake.principle;
+                    updated_wallet_stakes.liquid_stake.last_reward_day =
+                        smart_contracts::last_block_time() / 86400;
+                    updated_wallet_stakes.liquid_stake.daily_release +=
+                        wallet_stakes.liquid_stake.daily_release;
                     updated_wallet_stakes.liquid_stake.unstake_day = u64::MAX;
-
 
                     wallet_stakes.liquid_stake.bump_id = 0;
                     wallet_stakes.liquid_stake.principle = 0;
@@ -962,8 +1094,10 @@ pub mod staking_v1 {
                     wallet_stakes.liquid_stake.unstake_day = 0;
 
                     let mut all_stakers: AllStakers = load_state(ALL_STAKERS_KEY).unwrap();
-                    
-                    if wallet_stakes.staker_states.is_empty() && wallet_stakes.liquid_stake.bump_id == 0{
+
+                    if wallet_stakes.staker_states.is_empty()
+                        && wallet_stakes.liquid_stake.bump_id == 0
+                    {
                         all_stakers.staker_states.remove(&sender_wallet.clone());
                         smart_contracts::clear_state(wallet_stake_key.clone());
                     }
@@ -972,12 +1106,10 @@ pub mod staking_v1 {
                     save_state(ALL_STAKERS_KEY, &all_stakers);
                     save_state(&updated_stake_key, &updated_wallet_stakes);
                     save_state(&wallet_stake_key, &wallet_stakes);
-                    let emit1 = format!(
-                        "Success: Liquid stake updated from {} to {}",
-                        sender_wallet.clone(),
-                        wallet_address.clone()
-                    );
-                    smart_contracts::emit(emit1.clone());
+
+                    smart_contracts::emit("LIQUID_STAKE_UPDATED".to_string());
+                    smart_contracts::emit(format!("old_wallet: {}", sender_wallet));
+                    smart_contracts::emit(format!("new_wallet: {}", wallet_address));
                     return;
                 } else {
                     return;
@@ -986,15 +1118,144 @@ pub mod staking_v1 {
         }
     }
 
+    #[wasmedge_bindgen]
+    pub fn update_instant_wallet(wallet_address: String, bump_id: String) {
+        unsafe {
+            if !check_auth() {
+                return;
+            }
+
+            if !is_valid_wallet_address(&wallet_address) {
+                return;
+            }
+
+            if bump_id.parse::<u64>().is_err() {
+                smart_contracts::emit("Failed: Invalid bump_id, must be a valid u64".to_string());
+                return;
+            }
+
+            let original_wallet = smart_contracts::wallet_address();
+
+            let mut all_instant_stakers: AllInstantStakers = load_state(ALL_INSTANT_STAKERS_KEY).unwrap();
+
+            if !all_instant_stakers.staker_states.contains_key(&original_wallet.to_string()) {
+                smart_contracts::emit("Failed: Original wallet not found in instant stakers".to_string());
+                return;
+            }
+
+            let original_instant_stake_key = format!("{}_{}", INSTANT_STAKES_KEY, original_wallet.to_string());
+
+            let mut original_instant_stakes: AllWalletInstantStakes = load_state(&original_instant_stake_key).unwrap();
+
+            let stake : InstantStake = match original_instant_stakes.staker_states.get(&bump_id.to_string()) {
+                Some(s) => s.clone(),
+                None => {
+                    smart_contracts::emit("Failed: Bump ID not found in original wallet's instant stakes".to_string());
+                    return;
+                }
+            };
+
+            let new_instant_stake_key = format!("{}_{}", INSTANT_STAKES_KEY, wallet_address.to_string());
+
+            let mut new_instant_stakes: AllWalletInstantStakes = load_state(&new_instant_stake_key)
+                .unwrap_or(AllWalletInstantStakes {
+                    staker_states: HashMap::new(),
+                });
+
+            let term = stake.term.clone();
+            new_instant_stakes.staker_states.insert(bump_id.to_string(), stake);
+            original_instant_stakes.staker_states.remove(&bump_id.to_string());
+            
+            if original_instant_stakes.staker_states.is_empty() {
+                smart_contracts::delegate_clear_state(original_instant_stake_key.clone(), PROXY_CONTRACT.to_string());
+                all_instant_stakers.staker_states.remove(&original_wallet.to_string());
+            }
+            else{
+                save_state(&original_instant_stake_key, &original_instant_stakes);
+            }
+
+            if !all_instant_stakers.staker_states.contains_key(&wallet_address) {
+                all_instant_stakers.staker_states.insert(wallet_address.clone(), 1);
+            }
+
+            save_state(&new_instant_stake_key, &new_instant_stakes);
+            save_state(ALL_INSTANT_STAKERS_KEY, &all_instant_stakers);
+
+            smart_contracts::emit("INSTANT_STAKE_UPDATED".to_string());
+            smart_contracts::emit(format!("old_wallet: {}", original_wallet));
+            smart_contracts::emit(format!("new_wallet: {}", wallet_address));
+            smart_contracts::emit(format!("term: {}", term));
+            smart_contracts::emit(format!("bump_id: {}", bump_id));
+        }
+    }
     fn save_state<T: Serialize>(key: &str, data: &T) -> bool {
         let bytes = postcard::to_allocvec(data).unwrap();
         let b64 = base64::encode(bytes);
-        unsafe { smart_contracts::store_state(key.to_string(), b64) }
+        unsafe { smart_contracts::delegate_store_state(key.to_string(), b64, PROXY_CONTRACT.to_string()) }
     }
     fn load_state<T: DeserializeOwned>(key: &str) -> Result<T, bool> {
-        let b64 = unsafe { smart_contracts::retrieve_state(key.to_string()) };
+        let b64 = unsafe { smart_contracts::delegate_retrieve_state(key.to_string(), PROXY_CONTRACT.to_string()) };
         let bytes = base64::decode(b64).map_err(|_| false)?;
         postcard::from_bytes(&bytes).map_err(|_| false)
+    }
+
+     // Validates that a string is a valid Solana base58 address
+    // Zera addresses are 32-byte public keys encoded in base58
+    fn is_valid_wallet_address(address: &str) -> bool {
+        // Base58 alphabet (Bitcoin/Solana style - excludes 0, O, I, l)
+        const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        
+        // Check length (base58 encoded 32 bytes is typically 32-44 characters)
+        if address.len() < 32 || address.len() > 44 {
+            return false;
+        }
+        
+        // Check all characters are valid base58
+        for c in address.chars() {
+            if !BASE58_ALPHABET.contains(c) {
+                return false;
+            }
+        }
+        
+        // Additional validation: decode and verify it's exactly 32 bytes
+        match decode_base58(address) {
+            Some(decoded) => decoded.len() == 32,
+            None => false,
+        }
+    }
+
+     // Decodes a base58 string to bytes
+     fn decode_base58(input: &str) -> Option<Vec<u8>> {
+        const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        
+        let mut result: Vec<u8> = vec![0];
+        
+        for byte in input.bytes() {
+            let mut carry = BASE58_ALPHABET.iter().position(|&x| x == byte)? as u32;
+            
+            for result_byte in result.iter_mut() {
+                carry += (*result_byte as u32) * 58;
+                *result_byte = (carry & 0xFF) as u8;
+                carry >>= 8;
+            }
+            
+            while carry > 0 {
+                result.push((carry & 0xFF) as u8);
+                carry >>= 8;
+            }
+        }
+        
+        // Add leading zeros
+        for byte in input.bytes() {
+            if byte == b'1' {
+                result.push(0);
+            } else {
+                break;
+            }
+        }
+        
+        result.reverse();
+        Some(result)
     }
 
     #[derive(Serialize, Deserialize, Debug)]
@@ -1038,6 +1299,7 @@ pub mod staking_v1 {
         pub daily_release: u64,
         pub total_released: u64,
         pub last_reward_day: u64,
+        pub term: String,
     }
 
     #[derive(Serialize, Deserialize, Debug)]
@@ -1052,4 +1314,40 @@ pub mod staking_v1 {
     pub struct IdBumpState {
         pub id: u64,
     }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct AllInstantStakers {
+        pub staker_states: HashMap<String, u8>,
+        pub earliest_release_day: u64,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct AllWalletInstantStakes {
+        pub staker_states: HashMap<String, InstantStake>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct InstantStake {
+        pub principle: u64,
+        pub total_reward: u64,
+        pub release_day: u64,
+        pub term: String,
+    }
+
+    // need to migrate this to the new wallet stake struct
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct OldAllWalletStakes {
+        pub staker_states: HashMap<String, OldWalletStake>,
+        pub liquid_stake: LiquidStake,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct OldWalletStake {
+        pub principle: u64,
+        pub total_reward: u64,
+        pub daily_release: u64,
+        pub total_released: u64,
+        pub last_reward_day: u64,
+    }
+
 }

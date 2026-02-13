@@ -1,5 +1,5 @@
 [package]
-name = "staking_v1"
+name = "staking_v2"
 version = "0.1.0"
 edition = "2021"
 
