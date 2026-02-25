@@ -4,7 +4,7 @@ use anchor_lang::solana_program::program_option::COption;
 use anchor_lang::solana_program::program::invoke_signed;
 use anchor_lang::solana_program::system_instruction::transfer;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{self, Burn, Mint, Token, TokenAccount};
+use anchor_spl::token::{self, Burn, Mint, SyncNative, Token, TokenAccount};
 use mpl_token_metadata::instructions::CreateV1CpiBuilder;
 use mpl_token_metadata::types::{PrintSupply, TokenStandard};
 
@@ -18,6 +18,8 @@ const EXPECTED_CORE_ID: Pubkey = pubkey!("zera3giq7oM9QJaD6mY1ajGmakv9TZcax5Giky
 const MINT_AUTH_SEED: &[u8] = b"mint_authority";
 const MINT_SEED: &[u8] = b"mint";
 const VAULT_SEED: &[u8] = b"vault";
+/// Wrapped SOL mint address (native_mint)
+const WSOL_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
 const VERIFIED_SEED: &[u8] = b"verified_transfer"; // must match core
 const RELEASED_SEED: &[u8] = b"released_transfer";
 const VERIFIED_ADMIN_SEED: &[u8] = b"verified_admin"; // must match core
@@ -190,10 +192,11 @@ pub mod zera_bridge_token_v1 {
 
         // Check rate limits (outgoing operation with single tx limit check)
         // NOTE: get_usd_value returns value in nano-dollars
+        // Use wSOL mint for price lookup (SOL and wSOL share the same price)
         let amount_usd_nano = get_usd_value(
             amount,
             9, // SOL has 9 decimals
-            &System::id(), // Native SOL uses system_program as mint identifier
+            &WSOL_MINT,
             &ctx.accounts.token_price_registry,
         )? as i64;
         check_and_update_rate_limit(
@@ -203,52 +206,103 @@ pub mod zera_bridge_token_v1 {
             true, // is_outgoing
             true, // check_single_tx_limit
         )?;
-        //******************** RATE LIMIT CHECK END *********************************** */
 
-        // Enforce/initialize the vault PDA owned by this program
-        let (expected_vault, _bump) = Pubkey::find_program_address(&[VAULT_SEED], &crate::id());
-        let vault_bump = ctx.bumps.vault;
+        // Validate wSOL mint
         require_keys_eq!(
-            expected_vault,
-            ctx.accounts.vault.key(),
+            ctx.accounts.wsol_mint.key(),
+            WSOL_MINT,
+            SimpleErr::BadTokenAccount
+        );
+
+        // Validate router_signer PDA
+        let (expected_router_signer, _) =
+            Pubkey::find_program_address(&[ROUTER_SIGNER_SEED], ctx.program_id);
+        require_keys_eq!(
+            expected_router_signer,
+            ctx.accounts.router_signer.key(),
+            SimpleErr::BadRouterSigner
+        );
+
+        // Validate vault ATA is the router_signer's wSOL ATA
+        let expected_vault_ata = anchor_spl::associated_token::get_associated_token_address(
+            &expected_router_signer,
+            &WSOL_MINT,
+        );
+        require_keys_eq!(
+            expected_vault_ata,
+            ctx.accounts.vault_ata.key(),
             SimpleErr::BadVaultPda
         );
-        if ctx.accounts.vault.to_account_info().lamports() == 0 {
-            let lamports = Rent::get()?.minimum_balance(0);
-            let signer_seeds: &[&[u8]] = &[VAULT_SEED, &[vault_bump]];
-            anchor_lang::system_program::create_account(
-                CpiContext::new_with_signer(
-                    ctx.accounts.system_program.to_account_info(),
-                    anchor_lang::system_program::CreateAccount {
-                        from: ctx.accounts.payer.to_account_info(),
-                        to: ctx.accounts.vault.to_account_info(),
-                    },
-                    &[signer_seeds],
-                ),
-                lamports,
-                0,
-                &crate::id(),
-            )?;
-        } else {
-            require_keys_eq!(*ctx.accounts.vault.owner, crate::id(),SimpleErr::BadVaultOwner);
+
+        // Lazily create vault wSOL ATA if it doesn't exist
+        if ctx.accounts.vault_ata.to_account_info().data_is_empty() {
+            anchor_spl::associated_token::create(CpiContext::new(
+                ctx.accounts.associated_token_program.to_account_info(),
+                anchor_spl::associated_token::Create {
+                    payer: ctx.accounts.payer.to_account_info(),
+                    associated_token: ctx.accounts.vault_ata.to_account_info(),
+                    authority: ctx.accounts.router_signer.to_account_info(),
+                    mint: ctx.accounts.wsol_mint.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    token_program: ctx.accounts.token_program.to_account_info(),
+                },
+            ))?;
         }
 
+        // Lazily create payer's wSOL ATA if it doesn't exist
+        if ctx.accounts.payer_wsol_ata.to_account_info().data_is_empty() {
+            anchor_spl::associated_token::create(CpiContext::new(
+                ctx.accounts.associated_token_program.to_account_info(),
+                anchor_spl::associated_token::Create {
+                    payer: ctx.accounts.payer.to_account_info(),
+                    associated_token: ctx.accounts.payer_wsol_ata.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
+                    mint: ctx.accounts.wsol_mint.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    token_program: ctx.accounts.token_program.to_account_info(),
+                },
+            ))?;
+        }
+
+        // Step 1: Transfer native SOL from payer into payer's wSOL ATA
         anchor_lang::system_program::transfer(
             CpiContext::new(
                 ctx.accounts.system_program.to_account_info(),
                 anchor_lang::system_program::Transfer {
                     from: ctx.accounts.payer.to_account_info(),
-                    to: ctx.accounts.vault.to_account_info(),
+                    to: ctx.accounts.payer_wsol_ata.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+
+        // Step 2: Sync native - tells Token program to recognize the deposited lamports as wSOL
+        token::sync_native(CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            SyncNative {
+                account: ctx.accounts.payer_wsol_ata.to_account_info(),
+            },
+        ))?;
+
+        // Step 3: Transfer wSOL from payer's ATA to vault ATA
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.payer_wsol_ata.to_account_info(),
+                    to: ctx.accounts.vault_ata.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
                 },
             ),
             amount,
         )?;
 
         msg!(
-            r#"{{"event":"Lock_SOL","version":"{}","payer":"{}","vault":"{}","amount":"{}","zera_address":"{}", "solana_sender":"{}"}}"#,
+            r#"{{"event":"Lock_SOL","version":"{}","payer":"{}","vault_ata":"{}","mint":"{}","amount":"{}","zera_address":"{}","solana_sender":"{}"}}"#,
             PROGRAM_VERSION,
             ctx.accounts.payer.key(),
-            ctx.accounts.vault.key(),
+            ctx.accounts.vault_ata.key(),
+            WSOL_MINT,
             amount,
             zera_address_str,
             ctx.accounts.payer.key()
@@ -400,183 +454,7 @@ pub mod zera_bridge_token_v1 {
 
         Ok(())
     }
-    //WORKING / should pause on level 1 - pause working
-    pub fn release_sol(
-        ctx: Context<ReleaseSol>,
-        version: u8,
-        timestamp: u64,
-        expiry: u64,
-        txn_hash: [u8; 32],
-        event_index: u32,
-        amount: u64,
-        recipient: Pubkey,
-        usd_price_nano: u64, // Guardian-attested price in nano-dollars (10^-9 USD)
-    ) -> Result<()> {
-        require!(amount > 0, SimpleErr::InvalidAmount);
 
-        // Load and validate router_cfg from core program
-        let router_cfg_data = load_router_cfg(&ctx.accounts.router_cfg.to_account_info())?;
-        
-        // Check pause (incoming operation - block if level >= 1)
-        check_pause(&router_cfg_data, 1)?;
-
-        require_keys_eq!(
-            recipient,
-            ctx.accounts.recipient.key(),
-            SimpleErr::BadRecipient
-        );
-
-        // SECURITY: Validate recipient is a user wallet (EOA), not a program
-        // This prevents permanent fund loss if user specifies a program address
-        if *ctx.accounts.recipient.owner != System::id() {
-            msg!(
-                r#"{{"event":"Transfer_Rejected","reason":"InvalidRecipientType","recipient":"{}","recipient_owner":"{}","amount":"{}","txn_hash":"{}","event_index":"{}","action":"MANUAL_REFUND_REQUIRED"}}"#,
-                recipient,
-                ctx.accounts.recipient.owner,
-                amount,
-                to_hex(&txn_hash),
-                event_index
-            );
-            return Err(error!(SimpleErr::InvalidRecipientType));
-        }
-
-        // Optional freshness
-        if expiry != 0 {
-            require!(
-                Clock::get()?.unix_timestamp <= expiry as i64,
-                SimpleErr::Expired
-            );
-        }
-
-        // Build payload: amount + recipient + usd_price_nano
-        let mut payload = Vec::with_capacity(8 + 32 + 8);
-        payload.extend_from_slice(&amount.to_be_bytes());
-        payload.extend_from_slice(recipient.as_ref());
-        payload.extend_from_slice(&usd_price_nano.to_be_bytes());
-
-        let expected_hash = vaa_body_hash(
-            version,
-            ZERA_BRIDGE_TOKEN_DOMAIN,
-            ACTION_RELEASE_SOL,
-            timestamp,
-            expiry,
-            txn_hash,
-            event_index,
-            ctx.accounts.target_program.key(),
-            &payload,
-        );
-
-        let seeds: &[&[u8]] = &[VERIFIED_SEED, &expected_hash];
-
-        let (used_pda, _bump) = Pubkey::find_program_address(seeds, &EXPECTED_CORE_ID);
-
-        require_keys_eq!(
-            used_pda,
-            ctx.accounts.used_marker.key(),
-            SimpleErr::BadUsedMarkerPda
-        );
-        require_keys_eq!(
-            *ctx.accounts.used_marker.owner,
-            EXPECTED_CORE_ID,
-            SimpleErr::BadUsedMarkerOwner
-        );
-        require!(
-            ctx.accounts.used_marker.lamports() > 0,
-            SimpleErr::BadUsedMarkerLamports
-        );
-
-        let released_seeds: &[&[u8]] = &[RELEASED_SEED, &expected_hash];
-        let (released_pda, released_bump) =
-            Pubkey::find_program_address(released_seeds, ctx.program_id);
-        require_keys_eq!(
-            released_pda,
-            ctx.accounts.redeemed_marker.key(),
-            SimpleErr::BadRedeemedMarkerPda
-        );
-        require!(
-            ctx.accounts.redeemed_marker.lamports() == 0,
-            SimpleErr::BadRedeemedMarkerLamports
-        );
-
-        // VAA verified! Now safe to update registry and check rate limits
-        update_token_price_registry(
-            &mut ctx.accounts.token_price_registry,
-            System::id(), // Native SOL
-            usd_price_nano,
-        )?;
-
-        // Track rate limits (incoming operation, NO single tx limit check)
-        // Calculate USD value directly from VAA's guardian-attested price (in nano-dollars)
-        let amount_u128 = amount as u128;
-        let price_u128 = usd_price_nano as u128;
-        let usd_nano = (amount_u128 * price_u128) / 1_000_000_000; // SOL has 9 decimals
-        let amount_usd_nano = usd_nano.min(u64::MAX as u128) as i64;
-        check_and_update_rate_limit(
-            &mut ctx.accounts.rate_limit_state,
-            &router_cfg_data,
-            amount_usd_nano,
-            false, // is_outgoing (this is incoming)
-            false, // check_single_tx_limit (no check for incoming)
-        )?;
-
-        let (expected_vault, _bump) =
-            Pubkey::find_program_address(&[VAULT_SEED], &crate::id());
-        let vault_bump = ctx.bumps.vault;
-
-        require_keys_eq!(
-            expected_vault,
-            ctx.accounts.vault.key(),
-            SimpleErr::BadVaultPda
-        );
-        require_keys_eq!(
-            *ctx.accounts.vault.owner,
-            crate::id(),
-            SimpleErr::BadVaultOwner
-        );
-        
-        // Ensure vault maintains rent-exempt minimum after transfer
-        let rent_minimum = Rent::get()?.minimum_balance(0);
-        require!(
-            ctx.accounts.vault.lamports() >= amount + rent_minimum,
-            SimpleErr::InsufficientVaultBalance
-        );
-
-        // IMPORTANT: Perform all CPIs BEFORE manual lamport transfers
-        // This avoids "sum of account balances before and after instruction do not match" error
-        // Create redeemed marker to prevent replay (CPI must happen first)
-        let lamports = Rent::get()?.minimum_balance(0);
-        let released_signer_seeds: &[&[u8]] = &[RELEASED_SEED, &expected_hash, &[released_bump]];
-        anchor_lang::system_program::create_account(
-            CpiContext::new_with_signer(
-                ctx.accounts.system_program.to_account_info(),
-                anchor_lang::system_program::CreateAccount {
-                    from: ctx.accounts.payer.to_account_info(),
-                    to: ctx.accounts.redeemed_marker.to_account_info(),
-                },
-                &[released_signer_seeds],
-            ),
-            lamports,
-            0,
-            ctx.program_id,
-        )?;
-
-        // NOW perform manual lamport transfer AFTER all CPIs are complete
-        // Manual transfer required because vault is owned by this program, not system program
-        **ctx.accounts.vault.to_account_info().try_borrow_mut_lamports()? -= amount;
-        **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? += amount;
-
-        msg!(
-            r#"{{"event":"Release_SOL","version":"{}","recipient":"{}","vault":"{}","amount":"{}","txn_hash":"{}","event_index":"{}"}}"#,
-            version,
-            recipient,
-            ctx.accounts.vault.key(),
-            amount,
-            to_hex(&txn_hash),
-            event_index
-        );
-
-        Ok(())
-    }
     //WORKING / should pause on level 1 - pause working
     pub fn release_spl(
         ctx: Context<ReleaseSpl>,
@@ -1202,27 +1080,27 @@ pub mod zera_bridge_token_v1 {
             //TODO : ADD BACK FOR DEVNET/MAINNET
             /* COMMENTED OUT FOR LOCALNET - Uncomment for devnet/mainnet: */
             
-            // CreateV1CpiBuilder::new(&ctx.accounts.metadata_program.to_account_info())
-            //     .metadata(&ctx.accounts.metadata.to_account_info())
-            //     .mint(&ctx.accounts.wrapped_mint.to_account_info(), false)
-            //     .authority(&ctx.accounts.mint_authority.to_account_info())
-            //     .payer(&ctx.accounts.payer.to_account_info())
-            //     .update_authority(&ctx.accounts.mint_authority.to_account_info(), false)
-            //     .system_program(&ctx.accounts.system_program.to_account_info())
-            //     .sysvar_instructions(&ctx.accounts.sysvar_instructions.to_account_info())
-            //     .spl_token_program(Some(&ctx.accounts.token_program.to_account_info()))
-            //     .name(wrapped_name.clone())
-            //     .symbol(wrapped_symbol.clone())
-            //     .uri(uri_val.clone())
-            //     .seller_fee_basis_points(0)
-            //     .decimals(decimals_val)
-            //     .token_standard(TokenStandard::Fungible)
-            //     .print_supply(PrintSupply::Zero)
-            //     .invoke_signed(&[&[
-            //         MINT_AUTH_SEED,
-            //         ctx.accounts.wrapped_mint.key().as_ref(),
-            //         &[mint_auth_bump],
-            //     ]])?;
+            CreateV1CpiBuilder::new(&ctx.accounts.metadata_program.to_account_info())
+                .metadata(&ctx.accounts.metadata.to_account_info())
+                .mint(&ctx.accounts.wrapped_mint.to_account_info(), false)
+                .authority(&ctx.accounts.mint_authority.to_account_info())
+                .payer(&ctx.accounts.payer.to_account_info())
+                .update_authority(&ctx.accounts.mint_authority.to_account_info(), false)
+                .system_program(&ctx.accounts.system_program.to_account_info())
+                .sysvar_instructions(&ctx.accounts.sysvar_instructions.to_account_info())
+                .spl_token_program(Some(&ctx.accounts.token_program.to_account_info()))
+                .name(wrapped_name.clone())
+                .symbol(wrapped_symbol.clone())
+                .uri(uri_val.clone())
+                .seller_fee_basis_points(0)
+                .decimals(decimals_val)
+                .token_standard(TokenStandard::Fungible)
+                .print_supply(PrintSupply::Zero)
+                .invoke_signed(&[&[
+                    MINT_AUTH_SEED,
+                    ctx.accounts.wrapped_mint.key().as_ref(),
+                    &[mint_auth_bump],
+                ]])?;
     
 
             let bridge_info_lamports = Rent::get()?.minimum_balance(BridgeTokenInfo::MAX_SIZE);
@@ -1664,43 +1542,6 @@ fn vaa_body_hash(
     hash(&buf).to_bytes()
 }
 
-// Update or add entry in token price registry
-// If usd_price_nano is 0, skip adding to registry (treat as $0 token)
-fn update_token_price_registry(
-    registry: &mut TokenPriceRegistry,
-    mint: Pubkey,
-    usd_price_nano: u64,
-) -> Result<()> {
-    // If price is 0, don't add to registry (will default to $0 on lookup)
-    if usd_price_nano == 0 {
-        msg!("Token price is $0, not adding to registry: {}", mint);
-        return Ok(());
-    }
-
-    let now = Clock::get()?.unix_timestamp;
-
-    // Check if entry exists, update it
-    if let Some(entry) = registry.entries.iter_mut().find(|e| e.mint == mint) {
-        entry.usd_price_nano = usd_price_nano;
-        entry.last_updated = now;
-        msg!("Updated price for mint {}: {} nano-dollars", mint, usd_price_nano);
-    } else {
-        // Add new entry
-        require!(
-            registry.entries.len() < TokenPriceRegistry::MAX_ENTRIES,
-            SimpleErr::RegistryFull
-        );
-        registry.entries.push(TokenPriceEntry {
-            mint,
-            usd_price_nano,
-            last_updated: now,
-        });
-        msg!("Added new price for mint {}: {} nano-dollars", mint, usd_price_nano);
-    }
-
-    Ok(())
-}
-
 // Get USD value from guardian-attested prices in registry
 // Returns USD value in nano-dollars, or 0 if not in registry
 fn get_usd_value(
@@ -1905,18 +1746,28 @@ pub struct LockSol<'info> {
     pub router_cfg: UncheckedAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
-    /// CHECK: vault PDA [b"vault"]
-    #[account(mut, seeds=[VAULT_SEED], bump)]
-    pub vault: UncheckedAccount<'info>,
-    /// CHECK: core used marker PDA [b"used", chain_le, expected_hash]
-    #[account()]
-    pub used_marker: UncheckedAccount<'info>,
+    /// Payer's wSOL associated token account (created lazily if needed)
+    /// CHECK: validated in function via ATA derivation
+    #[account(mut)]
+    pub payer_wsol_ata: UncheckedAccount<'info>,
+    /// Vault wSOL ATA (router_signer's wSOL ATA, same vault as lock_spl uses)
+    /// CHECK: validated in function via ATA derivation
+    #[account(mut)]
+    pub vault_ata: UncheckedAccount<'info>,
+    /// CHECK: router_signer PDA of this program [b"router_signer"]
+    #[account(seeds=[ROUTER_SIGNER_SEED], bump)]
+    pub router_signer: UncheckedAccount<'info>,
+    /// wSOL mint account
+    #[account(address = WSOL_MINT)]
+    pub wsol_mint: Account<'info, Mint>,
     /// Rate limit state PDA [b"rate_limit_state"]
     #[account(mut, seeds=[RATE_LIMIT_STATE_SEED], bump)]
     pub rate_limit_state: Account<'info, RateLimitState>,
     /// Token price registry PDA [b"token_price_registry"]
     #[account(seeds=[TOKEN_PRICE_REGISTRY_SEED], bump)]
     pub token_price_registry: Account<'info, TokenPriceRegistry>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
@@ -2024,41 +1875,6 @@ pub struct LockSpl<'info> {
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct ReleaseSol<'info> {
-    #[account(address = EXPECTED_CORE_ID)]
-    pub core_program: UncheckedAccount<'info>,
-    /// Core program's router config (for pause checking)
-    /// CHECK: deserialization verified in function via load_router_cfg
-    #[account(owner = EXPECTED_CORE_ID)]
-    pub router_cfg: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    /// CHECK: vault PDA [b"vault"]
-    #[account(mut, seeds=[VAULT_SEED], bump)]
-    pub vault: UncheckedAccount<'info>,
-    /// CHECK: core used marker PDA [b"verified_transfer", expected_hash]
-    #[account()]
-    pub used_marker: UncheckedAccount<'info>,
-    /// CHECK: token redeemed marker PDA [b"released_transfer", expected_hash]
-    #[account(mut)]
-    pub redeemed_marker: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub recipient: UncheckedAccount<'info>,
-    /// Rate limit state PDA [b"rate_limit_state"]
-    #[account(mut, seeds=[RATE_LIMIT_STATE_SEED], bump)]
-    pub rate_limit_state: Account<'info, RateLimitState>,
-    /// Price feed registry PDA [b"token_price_registry"]
-    #[account(mut, seeds=[TOKEN_PRICE_REGISTRY_SEED], bump)]
-    pub token_price_registry: Account<'info, TokenPriceRegistry>,
-    #[account()]
-    pub system_program: Program<'info, System>,
-    
-    /// CHECK: verified by address constraint
-    #[account(address = crate::id())]
-    pub target_program: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -2266,6 +2082,7 @@ pub struct TokenPriceEntry {
 impl TokenPriceEntry {
     pub const SIZE: usize = 32 + 8 + 8; // mint + usd_price_nano + last_updated
 }
+
 
 /// Per-token registration account for SPL tokens bridging to/from Zera
 /// Created via guardian VAA for native SPL tokens, or on first mint for wrapped tokens

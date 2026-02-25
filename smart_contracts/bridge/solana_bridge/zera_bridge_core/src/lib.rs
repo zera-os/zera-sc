@@ -3,12 +3,9 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     ed25519_program,
     hash::hash,
-    instruction::Instruction,
     program::invoke_signed,
     sysvar::instructions as sysvar_instructions,
 };
-use anchor_spl::associated_token::{self, AssociatedToken};
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer, TransferChecked};
 
 // Replace with your real program id when building
 declare_id!("zera3giq7oM9QJaD6mY1ajGmakv9TZcax5Giky99HD8");
@@ -61,10 +58,9 @@ pub mod zera_bridge_core {
         cfg.version = 1; // initial proxy version for upgrades/migrations tracking
         cfg.pause_level = 0; // initially active (not paused)
         cfg.pause_expiry = 0; // no expiry
-        // Values in nano-dollars (1e9 nano = $1)
-        // TODO: change back to 10M and 1M for production
-        cfg.rate_limit_usd = 1_000_000_000; // $10M in nano-dollars (10,000,000 * 1e9)
-        cfg.single_tx_limit_usd = 100_000_000; // $1M in nano-dollars (1,000,000 * 1e9)
+        //TODO: change back to 10M and 1M
+        cfg.rate_limit_usd = 1_000_000_000; // $10M in cents (10,000,000 * 100)
+        cfg.single_tx_limit_usd = 100_000_000; // $1M in cents (1,000,000 * 100)
 
         Ok(())
     }
@@ -1012,11 +1008,6 @@ fn check_pause(cfg: &RouterConfig, required_level: u8) -> Result<()> {
     Ok(())
 }
 
-// Helper to convert bytes to hex string
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 fn vaa_body_hash(
         version: u8,
         domain: &[u8],
@@ -1028,19 +1019,7 @@ fn vaa_body_hash(
         target_program: Pubkey,
         payload: &[u8],
     ) -> [u8; 32] {
-        // DEBUG: Log all hash inputs
-        msg!("=== VAA HASH DEBUG ===");
-        msg!("version: {}", version);
-        msg!("domain: {} (len={})", String::from_utf8_lossy(domain), domain.len());
-        msg!("action: {}", action);
-        msg!("timestamp: {}", timestamp);
-        msg!("expiry: {}", expiry);
-        msg!("txn_hash: {}", to_hex(&txn_hash));
-        msg!("event_index: {}", event_index);
-        msg!("target_program: {}", target_program);
-        msg!("payload_hex (len={}): {}", payload.len(), to_hex(payload));
 
-        // version(1) + domain(32) + action(1) + ts(8) + expiry(8) + txn_hash(32) + event_index(4) + target_program(32) + payload
         let mut buf = Vec::with_capacity(1 + domain.len() + 1 + 8 + 8 + 32 + 4 + 32 + payload.len());
 
         buf.push(version);
@@ -1053,11 +1032,7 @@ fn vaa_body_hash(
         buf.extend_from_slice(&target_program.as_ref());
         buf.extend_from_slice(payload);
 
-        msg!("full_buffer_hex (len={}): {}", buf.len(), to_hex(&buf));
-
         let result = hash(&buf).to_bytes();
-        msg!("expected_hash: {}", to_hex(&result));
-        msg!("=== END VAA HASH DEBUG ===");
 
         result
     }
@@ -1102,12 +1077,7 @@ fn vaa_body_hash(
         guardians: &[Pubkey],
         threshold: u8,
     ) -> Result<()> {
-        msg!("🔍 Looking for {} guardian signatures", threshold);
-        msg!("🔍 Configured guardians: {}", guardians.len());
-        for (i, g) in guardians.iter().enumerate() {
-            msg!("  Guardian {}: {}", i, g);
-        }
-        
+
         let mut uniq: std::collections::BTreeSet<Pubkey> = std::collections::BTreeSet::new();
         let mut idx = 0usize;
         let mut ed25519_ix_count = 0;
@@ -1119,7 +1089,6 @@ fn vaa_body_hash(
             let ix = loaded.unwrap();
             if ix.program_id == ed25519_program::id() {
                 ed25519_ix_count += 1;
-                msg!("🔍 Found ed25519 instruction #{}", ed25519_ix_count);
                 let d = ix.data;
                 if d.len() < 2 {
                     idx += 1;
@@ -1127,7 +1096,7 @@ fn vaa_body_hash(
                 }
                 let num = d[0] as usize;
                 let mut c = 2usize;
-                for s in 0..num {
+                for _ in 0..num {
                     if c + 14 > d.len() {
                         break;
                     }
@@ -1162,7 +1131,7 @@ fn vaa_body_hash(
                     let mut pk = [0u8; 32];
                     pk.copy_from_slice(&d[pk_off..pk_off + 32]);
                     let signer = Pubkey::new_from_array(pk);
-                    msg!("  📝 Signature from: {}", signer);
+                    msg!("Signature from: {}", signer);
                     let is_guardian = guardians.iter().any(|g| *g == signer);
                     if is_guardian {
                         msg!("  ✅ Valid guardian signature!");
@@ -1174,8 +1143,8 @@ fn vaa_body_hash(
             }
             idx += 1;
         }
-        msg!("🔍 Found {} ed25519 instructions total", ed25519_ix_count);
-        msg!("🔍 Valid unique guardian signatures: {}/{}", uniq.len(), threshold);
+        msg!("Found {} ed25519 instructions total", ed25519_ix_count);
+        msg!("Valid unique guardian signatures: {}/{}", uniq.len(), threshold);
         
         require!(
             (uniq.len() as u8) >= threshold,
@@ -1294,22 +1263,6 @@ pub struct UpgradeSelf<'info> {
 }
 
 #[derive(Accounts)]
-pub struct Initialize<'info> {
-    #[account(init, payer = payer, space = 8 + RouterConfig::SIZE, seeds=[ROUTER_CFG_SEED], bump)]
-    pub router_cfg: Account<'info, RouterConfig>,
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct SetImpl<'info> {
-    #[account(mut, seeds=[ROUTER_CFG_SEED], bump=router_cfg.cfg_bump)]
-    pub router_cfg: Account<'info, RouterConfig>,
-    // remaining_accounts: include at least `guardian_threshold` guardian signers
-}
-
-#[derive(Accounts)]
 pub struct MigrateV2<'info> {
     #[account(mut, seeds=[ROUTER_CFG_SEED], bump=router_cfg.cfg_bump)]
     pub router_cfg: Account<'info, RouterConfig>,
@@ -1402,6 +1355,15 @@ impl PendingVaaVerification {
     /// Size: 32 (hash) + 4 (bitmap) + 1 (count) + 4 (guardian_set_index) + 8 (created_at)
     ///       + 8 (expiry) + 1 (bump)
     pub const SIZE: usize = 32 + 4 + 1 + 4 + 8 + 8 + 1;
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(init, payer = payer, space = 8 + RouterConfig::SIZE, seeds=[ROUTER_CFG_SEED], bump)]
+    pub router_cfg: Account<'info, RouterConfig>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[account]
