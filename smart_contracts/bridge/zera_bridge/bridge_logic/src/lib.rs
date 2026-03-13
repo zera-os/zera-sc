@@ -1,4 +1,4 @@
-pub mod bridge_v2 {
+pub mod bridge_v3 {
     use base64::{decode, encode};
     use native_functions::zera::smart_contracts;
     use native_functions::zera::types;
@@ -558,14 +558,13 @@ pub fn lock_zera(contract_id: String, amount: String, solana_address: String) {
             smart_contracts::emit("Failed: Lock failed".to_string());
             return;
         }
-        let usd_value = get_usd_value(amount.clone(), contract_id.clone(), "0".to_string());
+
         let wallet_address = smart_contracts::wallet_address();
         smart_contracts::emit("EVENT:SEND_NATIVE_ZERA_TO_SOLANA".to_string());
         smart_contracts::emit(format!("contract_id: {}", contract_id.clone()));
         smart_contracts::emit(format!("amount: {}", amount.clone()));
         smart_contracts::emit(format!("solana_address: {}", solana_address.clone()));
         smart_contracts::emit(format!("zera_address: {}", wallet_address.clone()));
-        smart_contracts::emit(format!("usd_value: {}", usd_value.clone()));
     }
 }
 //USER FACING FUNCTION
@@ -651,9 +650,9 @@ pub fn burn_sol(contract_id: String, amount: String, solana_address: String) {
         let wallet_address = smart_contracts::wallet_address();
         smart_contracts::emit("EVENT:SEND_WRAPPED_SOLANA_TO_SOLANA".to_string());
         smart_contracts::emit(format!("contract_id: {}", contract_id.clone()));
+        smart_contracts::emit(format!("mint_id: {}", mint_id.clone()));
         smart_contracts::emit(format!("amount: {}", amount.clone()));
         smart_contracts::emit(format!("solana_address: {}", solana_address.clone()));
-        smart_contracts::emit(format!("mint_id: {}", mint_id.clone()));
         smart_contracts::emit(format!("zera_address: {}", wallet_address.clone()));
     }
 }
@@ -768,8 +767,13 @@ pub fn mint_sol(
 
         // Proceed with minting logic
         smart_contracts::emit("SUCCESS:MINT_NATIVE_SOLANA_TO_ZERA".to_string());
+        smart_contracts::emit(format!("contract_id: {}", contract_id.clone()));
+        smart_contracts::emit(format!("mint_id: {}", mint_id.clone()));
+        smart_contracts::emit(format!("amount: {}", amount.clone()));
+        smart_contracts::emit(format!("zera_address: {}", wallet_address.clone()));
     }
 }
+
 //PAYLOAD FUNCTION  - create new solana contracts on zera
 //create_native_solana_to_zera
 #[wasmedge_bindgen]
@@ -911,7 +915,7 @@ pub fn create_sol(
             smart_contracts::emit("SUCCESS:CONTRACT_CREATED".to_string());
             smart_contracts::emit(format!("contract_id: {}", contract_id.clone()));
             smart_contracts::emit(format!("mint_id: {}", mint_id.clone()));
-            smart_contracts::emit(format!("recipient: {}", wallet.clone()));
+            smart_contracts::emit(format!("zera_address: {}", wallet.clone()));
             smart_contracts::emit(format!("amount: {}", amount.clone()));
         } else {
             smart_contracts::emit("Failed: Contract already exists".to_string());
@@ -1006,7 +1010,7 @@ pub fn release_zera(
         smart_contracts::emit("SUCCESS:RELEASE_NATIVE_ZERA".to_string());
         smart_contracts::emit(format!("contract_id: {}", contract_id.clone()));
         smart_contracts::emit(format!("amount: {}", amount.clone()));
-        smart_contracts::emit(format!("recipient: {}", wallet_address.clone()));
+        smart_contracts::emit(format!("zera_address: {}", wallet_address.clone()));
     }
 }
 
