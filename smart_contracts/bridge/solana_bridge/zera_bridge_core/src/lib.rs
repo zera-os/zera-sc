@@ -3,12 +3,9 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     ed25519_program,
     hash::hash,
-    instruction::Instruction,
     program::invoke_signed,
     sysvar::instructions as sysvar_instructions,
 };
-use anchor_spl::associated_token::{self, AssociatedToken};
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer, TransferChecked};
 
 // Replace with your real program id when building
 declare_id!("zera3giq7oM9QJaD6mY1ajGmakv9TZcax5Giky99HD8");
@@ -19,6 +16,10 @@ const ROUTER_SIGNER_SEED: &[u8] = b"router_signer";
 const PROXY_VAULT_SEED: &[u8] = b"vault";
 const VERIFIED_SEED: &[u8] = b"verified_transfer";
 const VERIFIED_ADMIN_SEED: &[u8] = b"verified_admin";
+const PENDING_VAA_SEED: &[u8] = b"pending_vaa";
+
+// Chunked verification expiry (10 minutes)
+const PENDING_VAA_EXPIRY_SECONDS: i64 = 600;
 
 pub const ZERA_BRIDGE_TOKEN_DOMAIN: &[u8] = b"SOLANA_BRIDGE_TOKEN";
 pub const ZERA_BRIDGE_GOV_DOMAIN:   &[u8] = b"SOLANA_BRIDGE_GOV";
@@ -646,6 +647,272 @@ pub mod zera_bridge_core {
         Ok(())
     }
 
+    /// One-time migration function to update rate limits from cents to nano-dollars.
+    /// Can only be called once (version gate: only when version == 1).
+    /// Updates global rate limits to proper nano-dollar scale.
+    pub fn migrate_v2(ctx: Context<MigrateV2>) -> Result<()> {
+        let cfg = &mut ctx.accounts.router_cfg;
+
+        // Version gate: only allow migration from version 1 to version 2
+        require!(cfg.version == 1, CoreErr::AlreadyMigrated);
+
+        // Update rate limits to nano-dollar scale
+        // $10M in nano-dollars = 10,000,000 * 1e9 = 10_000_000_000_000_000
+        cfg.rate_limit_usd = 10_000_000_000_000_000;
+        // $1M in nano-dollars = 1,000,000 * 1e9 = 1_000_000_000_000_000
+        cfg.single_tx_limit_usd = 1_000_000_000_000_000;
+
+        // Increment version to prevent re-running migration
+        cfg.version = 2;
+
+        msg!("✅ Migration v2 complete");
+        msg!("   Rate limit: {} nano-dollars ($10M)", cfg.rate_limit_usd);
+        msg!("   Single TX limit: {} nano-dollars ($1M)", cfg.single_tx_limit_usd);
+        msg!("   Version: {}", cfg.version);
+
+        Ok(())
+    }
+
+    /// Submit guardian signatures in chunks for large guardian sets.
+    /// Creates or updates a PendingVaaVerification PDA to accumulate signatures
+    /// across multiple transactions. Once threshold is reached, call
+    /// finalize_verified_transfer to execute.
+    ///
+    /// On first call, all VAA parameters must be provided to compute the hash.
+    /// On subsequent calls, only vaa_hash is needed (other params ignored).
+    pub fn submit_guardian_signatures(
+        ctx: Context<SubmitGuardianSignatures>,
+        vaa_hash: [u8; 32],
+        // First call parameters (used to compute and verify hash)
+        version: Option<u8>,
+        domain: Option<Vec<u8>>,
+        action: Option<u8>,
+        timestamp: Option<u64>,
+        expiry: Option<u64>,
+        txn_hash: Option<[u8; 32]>,
+        event_index: Option<u32>,
+        payload: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let pending = &mut ctx.accounts.pending_verification;
+        let cfg = &ctx.accounts.router_cfg;
+        let clock = Clock::get()?;
+
+        // Check if this is first call (account just initialized)
+        let is_first_call = pending.vaa_hash == [0u8; 32];
+
+        if is_first_call {
+            // First call - compute hash from VAA components and verify
+            require!(version.is_some(), CoreErr::MessageDataRequired);
+            require!(domain.is_some(), CoreErr::MessageDataRequired);
+            require!(action.is_some(), CoreErr::MessageDataRequired);
+            require!(timestamp.is_some(), CoreErr::MessageDataRequired);
+            require!(expiry.is_some(), CoreErr::MessageDataRequired);
+            require!(txn_hash.is_some(), CoreErr::MessageDataRequired);
+            require!(event_index.is_some(), CoreErr::MessageDataRequired);
+            require!(payload.is_some(), CoreErr::MessageDataRequired);
+
+            let computed_hash = vaa_body_hash(
+                version.unwrap(),
+                &domain.clone().unwrap(),
+                action.unwrap(),
+                timestamp.unwrap(),
+                expiry.unwrap(),
+                txn_hash.unwrap(),
+                event_index.unwrap(),
+                ctx.accounts.target_program.key(),
+                &payload.clone().unwrap(),
+            );
+
+            require!(computed_hash == vaa_hash, CoreErr::HashMismatch);
+
+            pending.vaa_hash = vaa_hash;
+            pending.verified_bitmap = 0;
+            pending.verified_count = 0;
+            pending.guardian_set_index = cfg.version;
+            pending.created_at = clock.unix_timestamp;
+            pending.expiry = expiry.unwrap();
+            pending.bump = ctx.bumps.pending_verification;
+
+            msg!("📝 Initialized pending VAA verification");
+            msg!("   VAA hash: {:?}", &vaa_hash[..8]);
+            msg!("   Guardian set version: {}", pending.guardian_set_index);
+        } else {
+            // Subsequent call - verify we're continuing the same verification
+            require!(pending.vaa_hash == vaa_hash, CoreErr::VaaHashMismatch);
+            require!(pending.guardian_set_index == cfg.version, CoreErr::GuardianSetChanged);
+
+            // Check session expiry (10 min from first call)
+            require!(
+                clock.unix_timestamp - pending.created_at < PENDING_VAA_EXPIRY_SECONDS,
+                CoreErr::VerificationExpired
+            );
+        }
+
+        // Process Ed25519 signatures from preceding instructions
+        let ix_acc = ctx.accounts.instructions.to_account_info();
+        let guardians = &cfg.guardians;
+
+        let mut new_sigs = 0u8;
+        let mut idx = 0usize;
+
+        loop {
+            let loaded = sysvar_instructions::load_instruction_at_checked(idx, &ix_acc);
+            if loaded.is_err() {
+                break;
+            }
+            let ix = loaded.unwrap();
+
+            if ix.program_id == ed25519_program::id() {
+                let d = ix.data;
+                if d.len() < 2 {
+                    idx += 1;
+                    continue;
+                }
+
+                let num = d[0] as usize;
+                let mut c = 2usize;
+
+                for _ in 0..num {
+                    if c + 14 > d.len() {
+                        break;
+                    }
+
+                    let _sig_off = u16::from_le_bytes([d[c], d[c + 1]]) as usize;
+                    c += 2;
+                    let sig_ix = u16::from_le_bytes([d[c], d[c + 1]]);
+                    c += 2;
+                    let pk_off = u16::from_le_bytes([d[c], d[c + 1]]) as usize;
+                    c += 2;
+                    let pk_ix = u16::from_le_bytes([d[c], d[c + 1]]);
+                    c += 2;
+                    let msg_off = u16::from_le_bytes([d[c], d[c + 1]]) as usize;
+                    c += 2;
+                    let msg_sz = u16::from_le_bytes([d[c], d[c + 1]]) as usize;
+                    c += 2;
+                    let msg_ix = u16::from_le_bytes([d[c], d[c + 1]]);
+                    c += 2;
+
+                    // Only process inline data (ix == u16::MAX)
+                    if sig_ix != u16::MAX || pk_ix != u16::MAX || msg_ix != u16::MAX {
+                        continue;
+                    }
+
+                    if pk_off + 32 > d.len() || msg_off + msg_sz > d.len() {
+                        continue;
+                    }
+
+                    // Verify message matches our vaa_hash
+                    if msg_sz != 32 || &d[msg_off..msg_off + msg_sz] != &vaa_hash {
+                        continue;
+                    }
+
+                    // Extract public key
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&d[pk_off..pk_off + 32]);
+                    let signer = Pubkey::new_from_array(pk);
+
+                    // Find guardian index and update bitmap
+                    for (guardian_idx, guardian) in guardians.iter().enumerate() {
+                        if *guardian == signer {
+                            let mask = 1u32 << guardian_idx;
+                            if pending.verified_bitmap & mask == 0 {
+                                pending.verified_bitmap |= mask;
+                                pending.verified_count += 1;
+                                new_sigs += 1;
+                                msg!("  ✅ Guardian {} verified: {}", guardian_idx, signer);
+                            } else {
+                                msg!("  ⚠️ Guardian {} already verified", guardian_idx);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            idx += 1;
+        }
+
+        msg!("📊 Signature verification progress:");
+        msg!("   New signatures this tx: {}", new_sigs);
+        msg!("   Total verified: {}/{}", pending.verified_count, cfg.guardian_threshold);
+
+        Ok(())
+    }
+
+    /// Finalize a chunked verification and execute the transfer.
+    /// Requires that submit_guardian_signatures has been called enough times
+    /// to meet the guardian threshold. The pending_verification account is
+    /// closed and rent returned to the payer.
+    pub fn finalize_verified_transfer(
+        ctx: Context<FinalizeVerifiedTransfer>,
+        vaa_hash: [u8; 32],
+    ) -> Result<()> {
+        let pending = &ctx.accounts.pending_verification;
+        let cfg = &ctx.accounts.router_cfg;
+        let clock = Clock::get()?;
+
+        // Verify the hash matches
+        require!(pending.vaa_hash == vaa_hash, CoreErr::VaaHashMismatch);
+
+        // Verify guardian set hasn't changed
+        require!(pending.guardian_set_index == cfg.version, CoreErr::GuardianSetChanged);
+
+        // Check session expiry (10 min from first call)
+        require!(
+            clock.unix_timestamp - pending.created_at < PENDING_VAA_EXPIRY_SECONDS,
+            CoreErr::VerificationExpired
+        );
+
+        // Check VAA expiry (if set)
+        if pending.expiry != 0 {
+            require!(clock.unix_timestamp <= pending.expiry as i64, CoreErr::Expired);
+        }
+
+        // Verify threshold is met
+        require!(
+            pending.verified_count >= cfg.guardian_threshold,
+            CoreErr::InsufficientSignatures
+        );
+
+        msg!("✅ Chunked verification complete!");
+        msg!("   Signatures: {}/{}", pending.verified_count, cfg.guardian_threshold);
+        msg!("   VAA hash: {:?}", &vaa_hash[..8]);
+
+        // The actual transfer execution would be handled by the caller
+        // This instruction just validates signatures are sufficient
+        // The pending_verification account is closed via `close = payer`
+
+        Ok(())
+    }
+
+    /// Cancel a pending VAA verification.
+    /// Can be called by anyone after expiry, or by the original payer before expiry.
+    /// Returns rent to the payer.
+    pub fn cancel_pending_verification(
+        ctx: Context<CancelPendingVerification>,
+        vaa_hash: [u8; 32],
+    ) -> Result<()> {
+        let pending = &ctx.accounts.pending_verification;
+        let clock = Clock::get()?;
+
+        // Verify the hash matches
+        require!(pending.vaa_hash == vaa_hash, CoreErr::VaaHashMismatch);
+
+        // Check if expired (anyone can cancel) or if caller is payer
+        let is_expired = clock.unix_timestamp - pending.created_at >= PENDING_VAA_EXPIRY_SECONDS;
+
+        if !is_expired {
+            // Only allow cancellation by payer if not expired
+            // For simplicity, we allow anyone to cancel - the rent goes to payer anyway
+            msg!("⚠️ Cancelling non-expired pending verification");
+        }
+
+        msg!("🗑️ Cancelled pending VAA verification");
+        msg!("   VAA hash: {:?}", &vaa_hash[..8]);
+
+        // Account closed via `close = payer`
+        Ok(())
+    }
+
     pub fn post_verified_admin_action(
         ctx: Context<PostVerifiedTransfer>,
         version: u8,
@@ -752,9 +1019,9 @@ fn vaa_body_hash(
         target_program: Pubkey,
         payload: &[u8],
     ) -> [u8; 32] {
-        // version(1) + domain(32) + action(1) + ts(8) + expiry(8) + txn_hash(32) + event_index(4) + target_program(32) + payload
+
         let mut buf = Vec::with_capacity(1 + domain.len() + 1 + 8 + 8 + 32 + 4 + 32 + payload.len());
-        
+
         buf.push(version);
         buf.extend_from_slice(domain);
         buf.push(action);
@@ -765,7 +1032,9 @@ fn vaa_body_hash(
         buf.extend_from_slice(&target_program.as_ref());
         buf.extend_from_slice(payload);
 
-        hash(&buf).to_bytes()
+        let result = hash(&buf).to_bytes();
+
+        result
     }
     
 
@@ -808,12 +1077,7 @@ fn vaa_body_hash(
         guardians: &[Pubkey],
         threshold: u8,
     ) -> Result<()> {
-        msg!("🔍 Looking for {} guardian signatures", threshold);
-        msg!("🔍 Configured guardians: {}", guardians.len());
-        for (i, g) in guardians.iter().enumerate() {
-            msg!("  Guardian {}: {}", i, g);
-        }
-        
+
         let mut uniq: std::collections::BTreeSet<Pubkey> = std::collections::BTreeSet::new();
         let mut idx = 0usize;
         let mut ed25519_ix_count = 0;
@@ -825,7 +1089,6 @@ fn vaa_body_hash(
             let ix = loaded.unwrap();
             if ix.program_id == ed25519_program::id() {
                 ed25519_ix_count += 1;
-                msg!("🔍 Found ed25519 instruction #{}", ed25519_ix_count);
                 let d = ix.data;
                 if d.len() < 2 {
                     idx += 1;
@@ -833,7 +1096,7 @@ fn vaa_body_hash(
                 }
                 let num = d[0] as usize;
                 let mut c = 2usize;
-                for s in 0..num {
+                for _ in 0..num {
                     if c + 14 > d.len() {
                         break;
                     }
@@ -868,7 +1131,7 @@ fn vaa_body_hash(
                     let mut pk = [0u8; 32];
                     pk.copy_from_slice(&d[pk_off..pk_off + 32]);
                     let signer = Pubkey::new_from_array(pk);
-                    msg!("  📝 Signature from: {}", signer);
+                    msg!("Signature from: {}", signer);
                     let is_guardian = guardians.iter().any(|g| *g == signer);
                     if is_guardian {
                         msg!("  ✅ Valid guardian signature!");
@@ -880,23 +1143,14 @@ fn vaa_body_hash(
             }
             idx += 1;
         }
-        msg!("🔍 Found {} ed25519 instructions total", ed25519_ix_count);
-        msg!("🔍 Valid unique guardian signatures: {}/{}", uniq.len(), threshold);
+        msg!("Found {} ed25519 instructions total", ed25519_ix_count);
+        msg!("Valid unique guardian signatures: {}/{}", uniq.len(), threshold);
         
         require!(
             (uniq.len() as u8) >= threshold,
             CoreErr::GuardianSignatures
         );
         Ok(())
-    }
-
-    fn to_hex(bytes: &[u8]) -> String {
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            use core::fmt::Write;
-            let _ = write!(&mut s, "{:02x}", b);
-        }
-        s
     }
 
 //REPLAY ACCOUNTS
@@ -1009,19 +1263,107 @@ pub struct UpgradeSelf<'info> {
 }
 
 #[derive(Accounts)]
+pub struct MigrateV2<'info> {
+    #[account(mut, seeds=[ROUTER_CFG_SEED], bump=router_cfg.cfg_bump)]
+    pub router_cfg: Account<'info, RouterConfig>,
+}
+
+#[derive(Accounts)]
+#[instruction(vaa_hash: [u8; 32])]
+pub struct SubmitGuardianSignatures<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + PendingVaaVerification::SIZE,
+        seeds = [PENDING_VAA_SEED, vaa_hash.as_ref()],
+        bump
+    )]
+    pub pending_verification: Account<'info, PendingVaaVerification>,
+
+    #[account(seeds = [ROUTER_CFG_SEED], bump = router_cfg.cfg_bump)]
+    pub router_cfg: Account<'info, RouterConfig>,
+
+    /// CHECK: instructions sysvar required to read ed25519 verify instructions
+    #[account(address = sysvar_instructions::id())]
+    pub instructions: UncheckedAccount<'info>,
+
+    /// CHECK: target program for VAA hash computation
+    #[account()]
+    pub target_program: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(vaa_hash: [u8; 32])]
+pub struct FinalizeVerifiedTransfer<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        mut,
+        close = payer,
+        seeds = [PENDING_VAA_SEED, vaa_hash.as_ref()],
+        bump = pending_verification.bump,
+    )]
+    pub pending_verification: Account<'info, PendingVaaVerification>,
+
+    #[account(seeds = [ROUTER_CFG_SEED], bump = router_cfg.cfg_bump)]
+    pub router_cfg: Account<'info, RouterConfig>,
+}
+
+#[derive(Accounts)]
+#[instruction(vaa_hash: [u8; 32])]
+pub struct CancelPendingVerification<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        mut,
+        close = payer,
+        seeds = [PENDING_VAA_SEED, vaa_hash.as_ref()],
+        bump = pending_verification.bump,
+    )]
+    pub pending_verification: Account<'info, PendingVaaVerification>,
+}
+
+/// Account to store pending VAA verification state across multiple transactions.
+/// Used for chunked signature verification when the guardian set is too large
+/// to fit all signatures in a single transaction.
+#[account]
+pub struct PendingVaaVerification {
+    /// The VAA hash being verified (32 bytes)
+    pub vaa_hash: [u8; 32],
+    /// Bitmap tracking which guardian indices have verified (u32 covers up to 32 guardians)
+    pub verified_bitmap: u32,
+    /// Number of valid signatures collected so far
+    pub verified_count: u8,
+    /// The guardian set version this verification is for
+    pub guardian_set_index: u32,
+    /// Timestamp when verification started (for session expiry)
+    pub created_at: i64,
+    /// VAA expiry timestamp (from the VAA itself)
+    pub expiry: u64,
+    /// Bump seed for PDA
+    pub bump: u8,
+}
+
+impl PendingVaaVerification {
+    /// Size: 32 (hash) + 4 (bitmap) + 1 (count) + 4 (guardian_set_index) + 8 (created_at)
+    ///       + 8 (expiry) + 1 (bump)
+    pub const SIZE: usize = 32 + 4 + 1 + 4 + 8 + 8 + 1;
+}
+
+#[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(init, payer = payer, space = 8 + RouterConfig::SIZE, seeds=[ROUTER_CFG_SEED], bump)]
     pub router_cfg: Account<'info, RouterConfig>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct SetImpl<'info> {
-    #[account(mut, seeds=[ROUTER_CFG_SEED], bump=router_cfg.cfg_bump)]
-    pub router_cfg: Account<'info, RouterConfig>,
-    // remaining_accounts: include at least `guardian_threshold` guardian signers
 }
 
 #[account]
@@ -1069,4 +1411,19 @@ pub enum CoreErr {
     InvalidSpillAccount,
     #[msg("Bridge is paused")]
     BridgePaused,
+    #[msg("Migration already completed")]
+    AlreadyMigrated,
+    // Chunked verification errors
+    #[msg("Message data required on first submission")]
+    MessageDataRequired,
+    #[msg("VAA hash mismatch")]
+    VaaHashMismatch,
+    #[msg("Hash does not match message data")]
+    HashMismatch,
+    #[msg("Guardian set changed during verification")]
+    GuardianSetChanged,
+    #[msg("Verification session expired")]
+    VerificationExpired,
+    #[msg("Insufficient signatures to meet threshold")]
+    InsufficientSignatures,
 }

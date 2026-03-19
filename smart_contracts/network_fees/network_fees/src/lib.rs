@@ -1,4 +1,4 @@
-pub mod network_fees_v1 {
+pub mod network_fees_v2 {
     use native_functions::zera::smart_contracts;
     use native_functions::zera::types;
     use native_functions::zera::types::U256;
@@ -18,7 +18,7 @@ pub mod network_fees_v1 {
             smart_contracts::hold(ZRA_CONTRACT.to_string(), one_dolla_zera.to_string());
 
             //Key/hash fees
-            smart_contracts::store_state("A_KEY_FEE".to_string(), "20000000000000000".to_string());
+            smart_contracts::store_state("A_KEY_FEE".to_string(), "1".to_string());
             smart_contracts::store_state("B_KEY_FEE".to_string(), "50000000000000000".to_string());
             smart_contracts::store_state("a_HASH_FEE".to_string(), "20000000000000000".to_string());
             smart_contracts::store_state("b_HASH_FEE".to_string(), "50000000000000000".to_string());
@@ -38,9 +38,9 @@ pub mod network_fees_v1 {
             );
 
             smart_contracts::store_state("RESTRICTED_KEY_FEE".to_string(), "3".to_string());
-            smart_contracts::store_state("GAS_FEE".to_string(), "2500000000000".to_string());
-            smart_contracts::store_state("COIN_TYPE".to_string(), "150000000000000".to_string());
-            smart_contracts::store_state("STORAGE_FEE".to_string(), "1000000000000000".to_string());
+            smart_contracts::store_state("GAS_FEE".to_string(), "13750000000".to_string());
+            smart_contracts::store_state("COIN_TYPE".to_string(), "15000000000000".to_string());
+            smart_contracts::store_state("STORAGE_FEE".to_string(), "13500000000000".to_string());
             smart_contracts::store_state(
                 "CONTRACT_TXN_FEE".to_string(),
                 "860000000000000".to_string(),
@@ -65,7 +65,7 @@ pub mod network_fees_v1 {
             );
             smart_contracts::store_state(
                 "SMART_CONTRACT_EXECUTE_TYPE".to_string(),
-                "1500000000000000".to_string(),
+                "1500000000000".to_string(),
             );
             smart_contracts::store_state(
                 "SMART_CONTRACT_TYPE".to_string(),
@@ -168,7 +168,7 @@ pub mod network_fees_v1 {
                 }
                 if target_vec[i] == "VALIDATOR_MINIMUM_ZERA" {
                     // Handle VALIDATOR_MINIMUM_ZERA specifically
-                    if amount_u256 > U256::from(100_000_000_000_000) {
+                    if amount_u256 > types::string_to_u256("100000000000000".to_string()){
                         let emit1 = format!("Failed: VALIDATOR_MINIMUM_ZERA cannot be greater than 100 000 000 000 000");
                         smart_contracts::emit(emit1.clone());
                         return;
@@ -176,7 +176,7 @@ pub mod network_fees_v1 {
                 
                 } else if (target_vec[i] == "COIN_TYPE" || target_vec[i] == "VOTE_TYPE") {
                     // Handle other targets normally
-                    if amount_u256 > U256::from(10_000_000_000_000_000) {
+                    if amount_u256 > types::string_to_u256("10000000000000000".to_string()){
                         let emit1 = format!("Failed: COIN_TYPE and VOTE_TYPE cannot be greater than 10_000_000_000_000_000");
                         smart_contracts::emit(emit1.clone());
                         return;
