@@ -1,4 +1,4 @@
-pub mod zera_dex {
+pub mod zera_dex_v2 {
     use base64::{decode, encode};
     use native_functions::zera::smart_contracts;
     use native_functions::zera::types;
@@ -12,23 +12,77 @@ pub mod zera_dex {
     const ZRA_CONTRACT: &str = "$ZRA+0000";
     const LIQUIDITY_POOL_KEY: &str = "LP_";
     const FEE_KEY: &str = "FEE_";
-    const PROXY_WALLET: &str = "3uct7y6rcxW3KA8o8b2gqtaygw7hA39P3SyjV466fXWP";
+    const PROXY_WALLET: &str = "DL6EBMRbxNebp9AmELZVCAqoeY2Nn9HoXaFdHp9KHGwv"; //sc_dex_proxy_v1_1
     const SCALE: u64 = 1000000000; //10^9
     const DEX_BURN: &str = "DeXBurnDexBurnDexBurnDexBurnDexBurnDex";
     const LOCK_SEED: &str = "lock";
     const LOCK_KEY: &str = "LOCK_";
     const GOV_AUTH: &str = "gov_$ACE+0000";
-    const PROXY_CONTRACT: &str = "zera_dex_proxy_1";
+    const PROXY_CONTRACT: &str = "zera_dex_proxy_v1_1";
+    const PROXY_CONTRACT_INSTANCE: &str = "1";
+    const PROXY_CONTRACT_NAME: &str = "zera_dex_proxy_v1";
     const ACE_KEY: &str = "ACE_";
     const ONE_DOLLA: &str = "1000000000000000000"; //10^18
 
+    const FINISHED_KEY: &str = "FINISHED";
+
     #[wasmedge_bindgen]
     pub fn init() {
-        unsafe {
-            let locked_derived = smart_contracts::derive_wallet(LOCK_SEED.to_string());
-        }
     }
 
+    #[wasmedge_bindgen]
+    pub fn update_derived_wallets()
+    {
+        unsafe {
+
+            if smart_contracts::retrieve_state(FINISHED_KEY.to_string()) == "true" {
+                smart_contracts::emit("Failed: Already finished".to_string());
+                return;
+            }
+
+            if !check_auth() {
+                smart_contracts::emit("Failed: Must be called by proxy wallet".to_string());
+                return;
+            }
+
+            let fee_bps = "25";
+            let token1 = ZRA_CONTRACT;
+            let token2 = "$sol-USDC+000000";
+
+            let lp_key = format!("{}{}{}{}", LIQUIDITY_POOL_KEY, fee_bps, token1, token2);
+
+            let mut pool: LiquidityPool = match load_state::<LiquidityPool>(&lp_key) {
+                Ok(pool) => pool,
+                Err(_) => {
+                    smart_contracts::emit("Failed: Pool does not exist".to_string());
+                    return;
+                }
+            };
+
+            let old_derived = pool.derived_wallet.clone();
+
+            let new_derived = smart_contracts::derive_wallet_delegate(
+                format!("{}{}{}", token1, token2, fee_bps),
+                PROXY_CONTRACT_NAME.to_string(),
+                PROXY_CONTRACT_INSTANCE.to_string(),
+            );
+
+            pool.derived_wallet = new_derived.clone();
+
+            if !save_state(&lp_key, &pool) {
+                smart_contracts::emit("Failed: Could not save updated pool state".to_string());
+                return;
+            }
+
+            smart_contracts::store_state(FINISHED_KEY.to_string(), "true".to_string());
+
+
+            smart_contracts::emit("DERIVED_WALLETS_UPDATED".to_string());
+            smart_contracts::emit(format!("old_derived: {}", old_derived));
+            smart_contracts::emit(format!("new_derived: {}", new_derived));
+        }
+    }
+    
     #[wasmedge_bindgen]
     pub fn update_fees(treasury_fee: String, treasury_wallet: String) {
         unsafe {
@@ -76,7 +130,141 @@ pub mod zera_dex {
             smart_contracts::emit(format!("treasury_wallet: {}", treasury_wallet.clone()));
         }
     }
+    #[wasmedge_bindgen]
+    pub fn lock_liquidity_pool_tokens(token1: String, token2: String, fee_bps: String, amount: String, lock_timestamp: String) {
+        unsafe {
+            if !check_auth() {
+                smart_contracts::emit("Failed: Must be called by proxy wallet".to_string());
+                return;
+            }
 
+            if !valid_fee_bps(fee_bps.clone()) {
+                smart_contracts::emit(format!(
+                    "Failed: Invalid fee bps: {}. Must be 10, 25, 50, 100, 200, 400, or 800",
+                    fee_bps.clone()));
+            }
+
+            if !types::is_valid_u256(amount.clone()) {
+                smart_contracts::emit(format!("Failed: Invalid amount: {}", amount.clone()));
+                return;
+            }
+            if !lock_timestamp.parse::<u64>().is_ok() {
+                smart_contracts::emit(format!("Failed: Invalid lock timestamp: {}", lock_timestamp.clone()));
+                return;
+            }
+            let lock_timestamp_u64 = lock_timestamp.parse::<u64>().unwrap();
+            let current_time = smart_contracts::last_block_time();
+
+            if current_time >= lock_timestamp_u64 {
+                smart_contracts::emit(format!("Failed: Lock timestamp is already in the past: {}", lock_timestamp.clone()));
+                return;
+            }
+        
+
+            let amount_u256 = types::string_to_u256(amount.clone());
+
+            let mut lp_key = format!(
+                "{}{}{}{}",
+                LIQUIDITY_POOL_KEY,
+                fee_bps.clone(),
+                token1.clone(),
+                token2.clone()
+            );
+            let mut token1_calc = token1.clone();
+            let mut token2_calc = token2.clone();
+            let mut pool: LiquidityPool = match load_state::<LiquidityPool>(&lp_key) {
+                Ok(pool) => pool,
+                Err(_) => {
+                    // First order failed, try swapped order
+                    lp_key = format!(
+                        "{}{}{}{}",
+                        LIQUIDITY_POOL_KEY,
+                        fee_bps.clone(),
+                        token2.clone(),
+                        token1.clone()
+                    );
+                    match load_state::<LiquidityPool>(&lp_key) {
+                        Ok(pool) => {
+                            token1_calc = token2.clone();
+                            token2_calc = token1.clone();
+                            pool
+                        }
+                        Err(_) => {
+                            smart_contracts::emit(format!("Failed to unlock liquidity pool tokens for {} : Pool does not exist", token1.clone()));
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let wallet_address = smart_contracts::wallet_address();
+            let lp_balance = smart_contracts::wallet_balance(pool.lp_token_id.clone(), wallet_address.clone());
+
+            if lp_balance < amount_u256 {
+                smart_contracts::emit(format!("Failed: Insufficient LP tokens: {}", lp_balance.to_string()));
+                return;
+            }
+
+            let lock_key = format!(
+                "{}{}{}{}{}",
+                LOCK_KEY,
+                wallet_address.clone(),
+                token1_calc.clone(),
+                token2_calc.clone(),
+                fee_bps.clone()
+            );
+
+            let mut used_lock_timestamp = lock_timestamp_u64.clone();
+                // Load existing locked pool or create new one
+                let mut locked_lp: LockedLiquidityPool =
+                    match load_state::<LockedLiquidityPool>(&lock_key) {
+                        Ok(mut existing) => {
+                            // Update existing pool - add to lp_tokens
+                            used_lock_timestamp = existing.lock_timestamp.clone();
+                            let current_lp = types::string_to_u256(existing.lp_tokens.clone());
+                            existing.lp_tokens = (current_lp + amount_u256).to_string();
+
+                            if existing.lock_timestamp < lock_timestamp_u64 {
+                                existing.lock_timestamp = lock_timestamp_u64.clone();
+                                used_lock_timestamp = lock_timestamp_u64.clone();
+                            }
+                            existing
+                        }
+                        Err(_) => {
+                            // Create new pool
+                            LockedLiquidityPool {
+                                token1: token1_calc.clone(),
+                                token2: token2_calc.clone(),
+                                lp_tokens: amount_u256.to_string(),
+                                lock_timestamp: lock_timestamp_u64.clone(),
+                            }
+                        }
+                    };
+
+            let locked_derived = smart_contracts::derive_wallet_delegate(LOCK_SEED.to_string(), PROXY_CONTRACT_NAME.to_string(), PROXY_CONTRACT_INSTANCE.to_string());
+
+            if !smart_contracts::transfer(
+                pool.lp_token_id.clone(),
+                amount_u256.to_string(),
+                locked_derived.clone(),
+            ) {
+                smart_contracts::emit(format!("Failed to transfer liquidity pool tokens: {}", amount_u256.to_string()));
+                return;
+            }
+
+            save_state(&lock_key, &locked_lp);
+
+            smart_contracts::emit("LIQUIDITY_LOCKED".to_string());
+            smart_contracts::emit(format!("wallet_address: {}", wallet_address.clone()));
+            smart_contracts::emit(format!("token1: {}", token1_calc.clone()));
+            smart_contracts::emit(format!("token2: {}", token2_calc.clone()));
+            smart_contracts::emit(format!("fee_bps: {}", fee_bps.clone()));
+            smart_contracts::emit(format!("lp_tokens_locked: {}", amount_u256.to_string()));
+            smart_contracts::emit(format!("total_lp_tokens_locked: {}", locked_lp.lp_tokens.to_string()));
+            smart_contracts::emit(format!("lp_contract_id: {}", pool.lp_token_id.clone()));
+            smart_contracts::emit(format!("locked_timestamp: {}", used_lock_timestamp.to_string()));
+        }
+    }
     #[wasmedge_bindgen]
     pub fn unlock_liquidity_pool_tokens(token1: String, token2: String, fee_bps: String) {
         unsafe {
@@ -137,7 +325,7 @@ pub mod zera_dex {
                 fee_bps.clone()
             );
 
-            let locked_lp: LockedLiquidityPool = match load_state::<LockedLiquidityPool>(&lock_key)
+            let mut locked_lp: LockedLiquidityPool = match load_state::<LockedLiquidityPool>(&lock_key)
             {
                 Ok(locked_lp) => locked_lp,
                 Err(_) => {
@@ -149,21 +337,24 @@ pub mod zera_dex {
             let timestamp: u64 = smart_contracts::last_block_time();
 
             if timestamp < locked_lp.lock_timestamp {
+                let seconds_remaining = locked_lp.lock_timestamp - timestamp;
                 smart_contracts::emit(format!(
-                    "Failed to unlock liquidity pool tokens: {} Unlocked at {}",
+                    "Failed to unlock liquidity pool tokens: {} Unlocked in {} seconds",
                     locked_lp.lp_tokens.clone(),
-                    locked_lp.lock_timestamp
+                    seconds_remaining
                 ));
                 return;
             }
 
-            let locked_derived = smart_contracts::derive_wallet(LOCK_SEED.to_string());
+            let locked_derived = smart_contracts::derive_wallet_delegate(LOCK_SEED.to_string(), PROXY_CONTRACT_NAME.to_string(), PROXY_CONTRACT_INSTANCE.to_string());
 
-            if !smart_contracts::derived_send(
+            if !smart_contracts::derived_delegate_send(
                 pool.lp_token_id.clone(),
                 locked_lp.lp_tokens.clone(),
                 wallet_address.clone(),
                 locked_derived.clone(),
+                PROXY_CONTRACT_NAME.to_string(),
+                PROXY_CONTRACT_INSTANCE.to_string(),
             ) {
                 smart_contracts::emit(format!(
                     "Failed to transfer liquidity pool tokens: {}",
@@ -172,7 +363,7 @@ pub mod zera_dex {
                 return;
             }
 
-            smart_contracts::clear_state(lock_key);
+            smart_contracts::delegate_clear_state(lock_key, PROXY_CONTRACT.to_string());
 
             smart_contracts::emit("LIQUIDITY_UNLOCKED".to_string());
             smart_contracts::emit(format!("wallet_address: {}", wallet_address.clone()));
@@ -252,6 +443,7 @@ pub mod zera_dex {
             let token1_balance =
                 smart_contracts::wallet_balance(token1_calc.clone(), wallet_address.clone());
             if token1_balance < token1_volume_u256 {
+                smart_contracts::emit(format!("Failed: Insufficient {} balance: {}", token1_calc.clone(), token1_balance.to_string()));
                 return;
             }
 
@@ -259,6 +451,7 @@ pub mod zera_dex {
             let token2_balance =
                 smart_contracts::wallet_balance(token2_calc.clone(), wallet_address.clone());
             if token2_balance < token2_volume_u256 {
+                smart_contracts::emit(format!("Failed: Insufficient {} balance: {}", token2_calc.clone(), token2_balance.to_string()));
                 return;
             }
 
@@ -279,20 +472,23 @@ pub mod zera_dex {
 
             // Try to load existing pool - if it succeeds, pool already exists, so return/fail
             if load_state::<LiquidityPool>(&lp_key).is_ok() {
+                smart_contracts::emit(format!("Failed: Liquidity pool already exists: {} {} {}", token1_calc.clone(), token2_calc.clone(), fee_bps.clone()));
                 return; // Pool already exists, abort
             }
 
             // Try to load existing pool - if it succeeds, pool already exists, so return/fail
             if load_state::<LiquidityPool>(&lp_key_2).is_ok() {
+                smart_contracts::emit(format!("Failed: Liquidity pool already exists: {} {} {}", token2_calc.clone(), token1_calc.clone(), fee_bps.clone()));
                 return; // Pool already exists, abort
             }
 
-            let derived = smart_contracts::derive_wallet(format!(
+            let derived = smart_contracts::derive_wallet_delegate(format!(
                 "{}{}{}",
                 token1_calc.clone(),
                 token2_calc.clone(),
                 fee_bps.clone()
-            ));
+            ), PROXY_CONTRACT_NAME.to_string(), PROXY_CONTRACT_INSTANCE.to_string());
+            smart_contracts::emit(format!("derived: {}", derived.clone()));
 
             if !smart_contracts::transfer(
                 token1_calc.clone(),
@@ -320,7 +516,7 @@ pub mod zera_dex {
 
             let timestamp: u64 = smart_contracts::last_block_time();
             let lock_timestamp_u64 = lock_timestamp.parse::<u64>().unwrap();
-
+            let mut used_lock_timestamp = 0;
             if timestamp < lock_timestamp_u64 {
                 let locked_lp = LockedLiquidityPool {
                     token1: token1_calc.clone(),
@@ -328,7 +524,7 @@ pub mod zera_dex {
                     lp_tokens: lp_tokens_amount.to_string(),
                     lock_timestamp: lock_timestamp_u64.clone(),
                 };
-                let locked_derived = smart_contracts::derive_wallet(LOCK_SEED.to_string());
+                let locked_derived = smart_contracts::derive_wallet_delegate(LOCK_SEED.to_string(), PROXY_CONTRACT_NAME.to_string(), PROXY_CONTRACT_INSTANCE.to_string());
                 let lock_key = format!(
                     "{}{}{}{}{}",
                     LOCK_KEY,
@@ -340,6 +536,7 @@ pub mod zera_dex {
                 save_state(&lock_key, &locked_lp);
 
                 wallet_address = locked_derived.clone();
+                used_lock_timestamp = lock_timestamp_u64.clone();
             }
 
             let lp_token_id = smart_contracts::instrument_contract_dex(
@@ -374,7 +571,8 @@ pub mod zera_dex {
                 calc_ace_value(token2_calc.clone(), token1_volume_u256.clone(), token2_volume_u256.clone(), token2_denom.clone());
             }
 
-            smart_contracts::emit("LIQUIDITY_CREATED".to_string());
+            smart_contracts::emit(format!("pool derived: {}", liquidity_pool.derived_wallet.clone()));
+            smart_contracts::emit("LIQUIDITY_POOL_CREATED".to_string());
             smart_contracts::emit(format!("token1: {}", token1_calc.clone()));
             smart_contracts::emit(format!("token2: {}", token2_calc.clone()));
             smart_contracts::emit(format!("fee_bps: {}", fee_bps.clone()));
@@ -385,6 +583,7 @@ pub mod zera_dex {
             ));
             smart_contracts::emit(format!("amount_token1: {}", token1_volume_str.clone()));
             smart_contracts::emit(format!("amount_token2: {}", token2_volume_str.clone()));
+            smart_contracts::emit(format!("locked_timestamp: {}", used_lock_timestamp.to_string()));
         }
     }
 
@@ -532,8 +731,9 @@ pub mod zera_dex {
 
             let timestamp: u64 = smart_contracts::last_block_time();
             let lock_timestamp_u64 = lock_timestamp.parse::<u64>().unwrap();
-
+            let mut used_lock_timestamp = 0;
             if timestamp < lock_timestamp_u64 {
+                used_lock_timestamp = lock_timestamp_u64.clone();
                 let mut lock_key = format!(
                     "{}{}{}{}{}",
                     LOCK_KEY,
@@ -547,10 +747,15 @@ pub mod zera_dex {
                 let mut locked_lp: LockedLiquidityPool =
                     match load_state::<LockedLiquidityPool>(&lock_key) {
                         Ok(mut existing) => {
+                            used_lock_timestamp = existing.lock_timestamp.clone();
                             // Update existing pool - add to lp_tokens
                             let current_lp = types::string_to_u256(existing.lp_tokens.clone());
                             existing.lp_tokens = (current_lp + lp_tokens_to_mint).to_string();
-                            existing.lock_timestamp = lock_timestamp_u64.clone();
+
+                            if existing.lock_timestamp < lock_timestamp_u64 {
+                                existing.lock_timestamp = lock_timestamp_u64.clone();
+                                used_lock_timestamp = lock_timestamp_u64.clone();
+                            }
                             existing
                         }
                         Err(_) => {
@@ -563,7 +768,7 @@ pub mod zera_dex {
                             }
                         }
                     };
-                let locked_derived = smart_contracts::derive_wallet(LOCK_SEED.to_string());
+                let locked_derived = smart_contracts::derive_wallet_delegate(LOCK_SEED.to_string(), PROXY_CONTRACT_NAME.to_string(), PROXY_CONTRACT_INSTANCE.to_string());
                 save_state(&lock_key, &locked_lp);
 
                 wallet_address = locked_derived.clone();
@@ -616,6 +821,7 @@ pub mod zera_dex {
                 "lp_tokens_redeemed_total: {}",
                 pool.redeemed_lp_tokens.to_string()
             ));
+            smart_contracts::emit(format!("locked_timestamp: {}", used_lock_timestamp.to_string()));
         }
     }
 
@@ -722,20 +928,24 @@ pub mod zera_dex {
             token1_out = (token1_out * token1_denom) / SCALE;
             token2_out = (token2_out * token2_denom) / SCALE;
 
-            if !smart_contracts::derived_send(
+            if !smart_contracts::derived_delegate_send(
                 token1_calc.clone(),
                 token1_out.to_string(),
                 wallet_address.clone(),
                 pool.derived_wallet.clone(),
+                PROXY_CONTRACT_NAME.to_string(),
+                PROXY_CONTRACT_INSTANCE.to_string(),
             ) {
                 panic!("derived send failed");
             }
 
-            if !smart_contracts::derived_send(
+            if !smart_contracts::derived_delegate_send(
                 token2_calc.clone(),
                 token2_out.to_string(),
                 wallet_address.clone(),
                 pool.derived_wallet.clone(),
+                PROXY_CONTRACT_NAME.to_string(),
+                PROXY_CONTRACT_INSTANCE.to_string(),
             ) {
                 panic!("derived send failed");
             }
@@ -959,13 +1169,15 @@ pub mod zera_dex {
             
             let mut platform_out : U256 = U256::zero();
             if platform_bps_u256 == U256::zero() {
-                if !smart_contracts::derived_send(
+                if !smart_contracts::derived_delegate_send(
                     token2.clone(),
                     token_out.to_string(),
                     wallet_address.clone(),
                     pool.derived_wallet.clone(),
+                    PROXY_CONTRACT_NAME.to_string(),
+                    PROXY_CONTRACT_INSTANCE.to_string(),
                 )   {
-                    panic!("derived send failed");
+                    panic!("derived delegate send failed");
                 }
             }
             else{
@@ -974,9 +1186,9 @@ pub mod zera_dex {
                 let swap_amounts = vec![swap_out.to_string(), platform_out.to_string()];
                 let swap_addresses = vec![wallet_address.clone(), platform_wallet.clone()];
 
-                if !smart_contracts::derived_send_multi(token2.clone(), token_out.to_string(), swap_amounts, swap_addresses, pool.derived_wallet.clone())
+                if !smart_contracts::derived_delegate_send_multi(token2.clone(), token_out.to_string(), swap_amounts, swap_addresses, pool.derived_wallet.clone(), PROXY_CONTRACT_NAME.to_string(), PROXY_CONTRACT_INSTANCE.to_string())
                 {
-                    panic!("derived send multi failed");
+                    panic!("derived delegate send multi failed");
                 }
             }
             let mut new_token1_volume = U256::zero();
@@ -1014,8 +1226,13 @@ pub mod zera_dex {
             smart_contracts::emit(format!("fee_bps: {}", fee_bps.clone()));
             smart_contracts::emit(format!("amount_in: {}", token1_volume.clone()));
             smart_contracts::emit(format!("amount_out: {}", token_out.to_string()));
-            smart_contracts::emit(format!("reserve_in: {}", new_token1_volume.to_string()));
-            smart_contracts::emit(format!("reserve_out: {}", new_token2_volume.to_string()));
+            if swapped {
+                smart_contracts::emit(format!("reserve_in: {}", new_token2_volume.to_string()));
+                smart_contracts::emit(format!("reserve_out: {}", new_token1_volume.to_string()));
+            } else {
+                smart_contracts::emit(format!("reserve_in: {}", new_token1_volume.to_string()));
+                smart_contracts::emit(format!("reserve_out: {}", new_token2_volume.to_string()));
+            }
             smart_contracts::emit(format!("treasury_fee: {}", treasury_out.to_string()));
             smart_contracts::emit(format!("reward_fee: {}", reward_fee.to_string()));
             smart_contracts::emit(format!("platform_fee: {}", platform_out.to_string()));
