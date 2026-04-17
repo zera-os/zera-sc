@@ -71,7 +71,21 @@ Located in `smart_contracts/staking/`
   - `principle`: Manages staked principal amounts
   - `principle_proxy`: Proxy for principle management
 
-### 7. DEX (Decentralized Exchange)
+### 7. Bootstrapping
+Located in `smart_contracts/bootstrapping/`
+- **Purpose**: Incentivizes early liquidity provisioning by allowing users to stake DEX LP tokens and earn ZRA rewards
+- **Contracts**:
+  - `bootstrapping` (bootstrapping_v1): Core staking logic, weight-based reward distribution
+  - `proxy` (bootstrapping_proxy): Upgradeable proxy
+- **Features**:
+  - LP token staking (Zera DEX LP and Solana LP tokens)
+  - 10 lock-up terms from 30 days to 7 years with increasing weight multipliers (1x to 5x)
+  - Solana LP bonus multiplier (~31.6x additional weight)
+  - 10-phase decreasing reward schedule spanning ~11.5 years
+  - Weight-proportional daily ZRA distribution
+  - LP token principal returned on term expiry via derived wallet
+
+### 8. DEX (Decentralized Exchange)
 Located in `smart_contracts/dex/`
 - **Purpose**: On-chain automated market maker (AMM) for permissionless token swaps
 - **Contracts**:
@@ -86,7 +100,7 @@ Located in `smart_contracts/dex/`
   - ACE price oracle integration for ZRA-paired pools
   - Split fee model: treasury + LP rewards
 
-### 8. Bridge System
+### 9. Bridge System
 Located in `smart_contracts/bridge/`
 - **Purpose**: Bidirectional cross-chain bridge between Zera Network and Solana
 - **Architecture**:
@@ -105,7 +119,7 @@ Located in `smart_contracts/bridge/`
   - Pause mechanism for emergency stops
   - Cross-chain governance coordination
 
-### 9. Treasury
+### 10. Treasury
 Located in `smart_contracts/treasury/`
 - **Purpose**: Central treasury for fund management
 - **Contracts**:
@@ -169,6 +183,7 @@ Proxy wallet addresses are hardcoded in each contract for security:
 - Principle Proxy: `8DABUMTHJtRXPTR4EkqHAYB6jW4XJy5F1YWNcFiSMDko`
 - Treasury: `4Yg2ZeYrzMjVBXvU2YWtuZ7CzWR9atnQCD35TQj1kKcH`
 - DEX Proxy: `3uct7y6rcxW3KA8o8b2gqtaygw7hA39P3SyjV466fXWP`
+- Bootstrapping Proxy: `2nuEvMULK77BCZPyLLThtUn9kvkJkjsSyky7Nb67FMC1`
 - Bridge Proxy: `9fTYjLqHDqCmb1U71a6kRXEYNMwNvTF9xYX48HG4d1WA`
 
 ### Solana Network
