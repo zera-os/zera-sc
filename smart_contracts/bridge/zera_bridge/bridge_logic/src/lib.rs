@@ -1,4 +1,4 @@
-pub mod bridge_v3 {
+pub mod bridge_v4 {
     use base64::{decode, encode};
     use native_functions::zera::smart_contracts;
     use native_functions::zera::types;
@@ -10,7 +10,6 @@ pub mod bridge_v3 {
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Serialize};
 
-    //TODO add real gov
     const GOV_CONTRACT: &str = "gov_$BRIDGEGUARDIAN+0000";
     const ZRA_CONTRACT: &str = "$ZRA+0000";
     const CONTRACT_EXIST_KEY: &str = "CONTRACT_EXIST";
@@ -34,6 +33,9 @@ pub mod bridge_v3 {
     const RATE_LIMIT_KEY: &str = "RATE_LIMIT_"; //key for rate limit
     const PAUSE_CONFIG_KEY: &str = "PAUSE_CONFIG"; //key for pause config
 
+    const ONE_TIME_RELEASE_KEY: &str = "ONE_TIME_RELEASE";  
+
+    
     // Validates that a string is a valid Solana base58 address
     // Solana addresses are 32-byte public keys encoded in base58
     fn is_valid_solana_address(address: &str) -> bool {
@@ -495,6 +497,62 @@ fn check_pause(required_level: u8, current_time: u64) -> Result<(), SimpleErr> {
 
 #[wasmedge_bindgen]
 pub fn init() {
+}
+#[wasmedge_bindgen]
+pub fn one_time_release() {
+    unsafe{
+        if let Err(e) = check_auth() {
+            smart_contracts::emit(format!("Failed: {}", e.msg()));
+            return;
+        }
+
+        let one_time_release = smart_contracts::delegate_retrieve_state(ONE_TIME_RELEASE_KEY.to_string(), PROXY_CONTRACT.to_string());
+
+        if !one_time_release.is_empty() {
+            smart_contracts::emit("Failed: One time release already used".to_string());
+            return;
+        }
+
+        let adr1 = "7NSRy6nsPgPDkJajfVBGthw5rJgegYJMbgVZcF8J5evT";
+        let adr2 = "78wdo6birjSHibHL4ZrxQYJHvgaioiyXxmvyVkfWDqPV";
+        let adr3 = "78wdo6birjSHibHL4ZrxQYJHvgaioiyXxmvyVkfWDqPV";
+        let adr4 = "DcvmdkYPqgjbQvceQGZGAG5V78gEVCFbKP2iqvUMXqB4";
+        let adr5 = "G9FnCggw2AoNhmYyvrL1Pj9ZvTvbeUu39ab7qPrcgx4J";
+
+        let zra_contract = "$ZRA+0000";
+        let usdc_contract = "$sol-USDC+000000";
+
+        let amount1 = "6000000000"; //zra
+        let amount2 = "1726137"; //usdc
+        let amount3 = "1999068"; //usdc
+        let amount4 = "1142490857"; //usdc
+        let amount5 = "70007244516474"; //zra
+
+        if (!smart_contracts::send(zra_contract.clone(), amount1.clone(), adr1.clone())) {
+            panic!("Failed: Send failed 1");
+        }
+
+        if (!smart_contracts::send(zra_contract.clone(), amount5.clone(), adr5.clone())) {
+            panic!("Failed: Send failed 2");
+        }
+
+        if (!smart_contracts::mint(usdc_contract.clone(), amount2.clone(), adr2.clone())) {
+            panic!("Failed: Mint failed 1");
+        }
+
+        if (!smart_contracts::mint(usdc_contract.clone(), amount3.clone(), adr3.clone())) {
+            panic!("Failed: Mint failed 2");
+        }
+
+        if (!smart_contracts::mint(usdc_contract.clone(), amount4.clone(), adr4.clone())) {
+            panic!("Failed: Mint failed 3");
+        }
+
+        smart_contracts::delegate_store_state(ONE_TIME_RELEASE_KEY.to_string(), "1".to_string(), PROXY_CONTRACT.to_string());
+
+        smart_contracts::emit("One time release successful".to_string());
+        return;
+    }
 }
 //USER FACING FUNCTION
 //send_native_zera_to_solana
